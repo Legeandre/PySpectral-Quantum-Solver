@@ -6,7 +6,7 @@
 
 ## Key Features
 
-* **Generalized Eigenvalue Problem Solver:** Solves equations of the type $-\\frac{d^{2}}{dx^{2}}+f(x))\\psi(x)=E~g(x)\\psi(x)$.
+* **Generalized Eigenvalue Problem Solver:** Solves equations of the type $(-\\frac{d^{2}}{dx^{2}}+f(x))\\psi(x)=E~g(x)\\psi(x)$.
 
 * **Domain Optimization:** Includes a native algorithm to find the optimal box length ($L\_{opt}$) to minimize truncation errors.
 
