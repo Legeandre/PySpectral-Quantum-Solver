@@ -6,7 +6,8 @@ Description: Library developed in Python with spectral methods for solving eigen
 
 Author:         Vagner Jandre Monteiro  
 Contact:        <vagner.jandre@iprj.uerj.br>
-Create date:    2025-03-24  
+Create date:    2025-03-24 
+last updated:   2026-02-15 
 Version:        2.0.0  
 Licence:        MIT License  
 Repository: ...
@@ -17,7 +18,6 @@ Dependencies:
       • os
       • numbers
       • time
-      • math
       • inspect
   – NumPy >= 1.20
   – SymPy >= 1.8
@@ -40,89 +40,134 @@ Changelog: ...
 #__license__   = "MIT"
 #__repo_url__  = "https://github.com/Legeandre/PySpectral-Quantum-Solver"
 
+
 # =========================================================================== 
 # Dependences
 # =========================================================================== 
 import warnings
 warnings.simplefilter(action='ignore')
 
+import os
 import numpy as np
 import sympy as sp
-import pandas as pd
 import datetime
-import os
 import numbers
 import time
-import math
 import inspect
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-import matplotlib.ticker as ticker
-from mpl_toolkits.mplot3d import Axes3D  
 
-from matplotlib.animation import FuncAnimation
 from scipy.linalg import eig, eigh
-from scipy.integrate import quad, fixed_quad
-
-from scipy.sparse.linalg import eigsh  
+from scipy.integrate import fixed_quad, quad
 from scipy.optimize import minimize_scalar
-from matplotlib.ticker import MaxNLocator, MultipleLocator
+from matplotlib.ticker import MaxNLocator
 from scipy.signal import find_peaks
+from typing import Callable, Optional
+from contextlib import contextmanager
+from scipy.special import roots_legendre
 
-from matplotlib import animation
+import random
+# Fix random seeds
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
+
+# =========================================================================== 
+# Safe Decorator
+# =========================================================================== 
+def safe_execution(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"[ERRO em {func.__name__}] {e}")
+            return None 
+    return wrapper
 
 # =========================================================================== 
 # Class
 # =========================================================================== 
 class SpectralMethod:
-    
-    def __init__(self, num_levels, length, f_function=None, g_function=None, num_digits=15, weight=None, root_filename="output", label="project", optimizer_L='n'):
+
+    def __init__(self, num_levels: int, length: float, 
+                 f_function: Optional[Callable] = None, 
+                 g_function: Optional[Callable] = None, 
+                 num_digits: int = 15, 
+                 weight: Optional[Callable] = None, 
+                 root_filename: str = "output", 
+                 label: str = "project", 
+                 optimizer_L: str = 'n',
+                 optimize_N: int = None,        # Specific N for optimization
+                 L_bounds: tuple = (0.1, 50.0), # Bounds for L
+                 ensure_reproducibility: bool = False):  
+                 
         
         """
-        Initializes the spectral problem.
-
-        Args:
-            num_levels (int): Number of levels (eigenfunctions) in the problem.
-            length (float): Length of interval L, positive.
-            f_function (callable): Function f.
-            g_function (callable): Function g.
-            num_digits (int, optional): Calculation precision (default: 15).
-            weight (callable, optional): Weight function w(x). If None, w(x) is assumed to be 1.
+        Initializes the spectral problem with validation and setup.
         """
-
         self.num_levels = num_levels
     
-        self.f_function = f_function if f_function is not None else lambda x: 0  # f(x) = 0 if not provided
-        self.g_function = g_function if g_function is not None else lambda x: 1  # g(x) = 1 if not provided
-        self.weight = weight if weight is not None else lambda x: 1  # w(x) = 1 if not provided
+        # Function definitions (with safe fallbacks)
+        self.f_function = f_function if f_function is not None else lambda x: np.float64(0.0)
+        self.g_function = g_function if g_function is not None else lambda x: np.float64(1.0)
+        self.weight = weight if weight is not None else lambda x: np.float64(1.0)
     
-        # Attributes that will be assigned after the calculation
+        # Precision and state settings
         self.num_digits = num_digits
         self.digits_used = num_digits
         
         self.has_spectrum_been_calculated = False
         self.has_eigenvectors_been_calculated = False
-        self.en_spectrum = None    # Ordered list of eigenvalues
-        self.eigenvectors = None  # Each element of eigenvectors will be a pair [E, eigenvector].     
-        self.version = "Spectral_2.0"
+        self.en_spectrum = None
+        self.eigenvectors = None     
+        self.version = "PySpectral"
         
-        # For file writing, we define a root (if none exists, we use "Output").
+        # --- File management ---
         self.root_filename = root_filename  
         self.label = label            
-        self.calculator_name = "Python"  # To identify the system used
+        self.calculator_name = "Python"
         
-        # Dictionary to cache the elements of the weight matrix.
-        self._weight_cache = {}
+        # Ensure the output folder exists. If it does not exist, create it.
+        if self.root_filename and not os.path.exists(self.root_filename):
+            try:
+                os.makedirs(self.root_filename)
+                print(f"Directory '{self.root_filename}' created successfully.")
+            except OSError as e:
+                print(f"Warning: Could not create directory '{self.root_filename}'. Error: {e}")
 
-        # Selects whether the length attribute will be user-defined or optimized.        
-        self.length = length
+        if ensure_reproducibility:
+            # Configure environment for maximum reproducibility
+            self._setup_reproducible_environment()
+        
+        # Cache for weight matrix
+        self._weight_cache = {}
+        self._f_integral_cache = {}
+        self._g_integral_cache = {}
+
+        # Precompute constants that will be used frequently
+        self._pi = np.pi
+        self._pi_squared = self._pi ** 2
+
+        # Set the initial length provided by the user
+        self.length = np.float64(length)
+        
         if optimizer_L.upper() == 'Y':
-                L_min = 0.1
-                L_max = 10 * length
-                tol = 10**(-self.num_digits)
-                self.length = self.optimize_length(L_min, L_max, tol)
- 
+            print(f"Optimizing the box length. Please wait…")
+            
+            opt_N = optimize_N if optimize_N is not None else num_levels
+            
+            # Clear caches
+            self.clear_caches()
+
+            self.length = self.optimize_length(
+                num_levels_opt=opt_N,
+                L_bounds=L_bounds,
+                verbose=True
+            )
+            
+            print(f"Optimized length: L = {self.length:.6f} (N={opt_N})")
+
     def define_problem(self, num_levels, length, f_function, g_function, variable, weight=1, label="Problem", num_digits=15):
         """
             Define the problem parameters.
@@ -152,9 +197,85 @@ class SpectralMethod:
         }
         print(f"Problem defined with label: {label}")
 
+    @contextmanager
+    def _temporary_state(self, **kwargs):
+        """
+        Context manager to temporarily modify class attributes.
+        Clears the caches only if length is changed.
+        """
+        old_values = {}
+        old_caches = {}
+        
+        try:
+            # Save current values
+            for key, value in kwargs.items():
+                old_values[key] = getattr(self, key)
+                setattr(self, key, value)
+            
+            # If length changes, clear all caches
+            if 'length' in kwargs and kwargs['length'] != old_values.get('length'):
+                old_caches = {
+                    'weight': self._weight_cache.copy(),
+                    'f_integral': self._f_integral_cache.copy(),
+                    'g_integral': self._g_integral_cache.copy()
+                }
+                self._weight_cache.clear()
+                self._f_integral_cache.clear()
+                self._g_integral_cache.clear()
+            
+            yield self
+            
+        finally:
+            # Restore previous values
+            for key, value in old_values.items():
+                setattr(self, key, value)
+            
+            # Restore caches if they were saved
+            if old_caches:
+                self._weight_cache = old_caches.get('weight', {})
+                self._f_integral_cache = old_caches.get('f_integral', {})
+                self._g_integral_cache = old_caches.get('g_integral', {})
+
+    def _setup_reproducible_environment(self):
+        """Configure the environment for reproducible calculations"""
+        
+        # Limit parallelism (avoids non-determinism)
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1'
+        os.environ['OPENBLAS_NUM_THREADS'] = '1'
+        
+        # Configure NumPy for deterministic mode
+        np.random.seed(42)  # Even if randomness is not explicitly used
+        np.set_printoptions(precision=16)  # For debugging
+        
+        # Configure floating-point behavior
+        try:
+            np.seterr(all='raise')  # Capture numerical errors
+        except:
+            pass
+        
+        print("Reproducibility mode enabled: 1 thread, fixed seed.")
+    
+    def __get_integration_grid(self):
+        """
+        Generates Gauss–Legendre quadrature nodes mapped to the interval [0, L], ensuring exact accuracy for polynomials up to approximately degree 4*N.
+        """
+        # A high N_quad ensures that oscillatory integrals are resolved with machine precision
+        n_quad = max(200, 2 * self.num_levels + 50)
+        
+        # Generate nodes and weights in [-1, 1]
+        x_leg, w_leg = roots_legendre(n_quad)
+        
+        # Map them to [0, L]
+        half_L = self.length * 0.5
+        x_real = half_L * (x_leg + 1.0)
+        weights = w_leg * half_L
+        
+        return x_real, weights, n_quad
+
     def __CIntegral(self, func, m, n):
         """
-            Computes the integral associated with the elements of C.
+        Computes the integral associated with the elements of C.
             For both diagonal and off-diagonal elements, uses the same formulation
             with the function `func` (which can be `f` or `g`).
 
@@ -169,14 +290,47 @@ class SpectralMethod:
                 In the original code, the integral is defined as:
                     2/L * ∫[0,L] sin(nπx/L) * func(x) * sin(mπx/L) dx
         """
-
         L = self.length
-        integrand = lambda x: np.sin((m * np.pi * x) / L) * np.sin((n * np.pi * x) / L) * func(x)
-        result, err1 = fixed_quad(integrand, 0.0, L, n=10000)
+        m, n = int(m), int(n)
         
+        # Identify which cache to use
+        if func is self.f_function:
+            cache_dict = self._f_integral_cache
+        elif func is self.g_function:
+            cache_dict = self._g_integral_cache
+        else:
+            cache_dict = self._weight_cache
         
-        return (2 / L) * result
-    
+        cache_key = (m, n, L)
+        if cache_key in cache_dict:
+            return cache_dict[cache_key]
+        
+        # Adaptive number of points
+        max_index = max(m, n)
+        n_points = min(100 + max_index * 30, 5000)
+        
+        pi_L = self._pi / L
+        
+        # CORRECT formulas for the sine basis
+        if m == n:
+            # ∫₀ᴸ sin²(mπx/L) f(x) dx = ∫₀ᴸ 0.5(1 - cos(2mπx/L)) f(x) dx
+            integrand = lambda x: 0.5 * (1.0 - np.cos(2.0 * m * pi_L * x)) * func(x)
+        else:
+            # ∫₀ᴸ sin(mπx/L) sin(nπx/L) f(x) dx 
+            # = ∫₀ᴸ 0.5[cos((m-n)πx/L) - cos((m+n)πx/L)] f(x) dx
+            integrand = lambda x: 0.5 * (np.cos((m - n) * pi_L * x) - np.cos((m + n) * pi_L * x)) * func(x)
+        
+        # Compute the integral
+        result, _ = fixed_quad(integrand, 0.0, L, n=n_points)
+        
+        # Normalization factor: (2/L) for the orthonormal basis
+        result = (2.0 / L) * result
+        
+        # Cache
+        cache_dict[cache_key] = result
+        return result
+
+    # --- This method is deprecated and has been replaced by higher-precision implementations.
     def __C_from_f_offdiagonal(self, m, n):
         """
             Off-diagonal, for f.
@@ -223,214 +377,223 @@ class SpectralMethod:
             return self.__C_from_g_diagonal(m)
         else:
             return self.__C_from_g_offdiagonal(m, n)
+    # ---
+
+    # ----- Methods for Weight Matrix -----
     
-    # --- Methods for Weight Matrix ---
+    # --- This method is deprecated and has been replaced by higher-precision implementations.
     def __weight_matrix_offdiagonal(self, m, n):
         """
-            Returns the (m, n) element of the off-diagonal weight matrix.
+            Returns the **(m, n) element** of the **off-diagonal weight matrix**.
         """
         return self.__CIntegral(self.weight, m, n)
 
     def __weight_matrix_diagonal(self, m):
         """
-            Returns the (m, m) diagonal element of the weight matrix.
+            Returns the **(m, m) diagonal element** of the **weight matrix**.
         """
         return self.__CIntegral(self.weight, m, m)
 
     def __weight_function(self, n, m):
         """
-            Returns the (n, m) element of the weight matrix,  
-            using memorization to avoid repeated recalculations.
+            Returns the **(n, m) element** of the **weight matrix**,  
+            using **memorization** to avoid repeated recalculations.
         """
         key = (n, m)
         if key in self._weight_cache:
             return self._weight_cache[key]
-        
-        # If n == m, use the diagonal case; otherwise, use the off-diagonal case.
+        # If `n == m`, use the diagonal case; otherwise, use the off-diagonal case.
         if n == m:
             value = self.__weight_matrix_diagonal(m)
         else:
             value = self.__weight_matrix_offdiagonal(m, n)
         self._weight_cache[key] = value
         return value
-    
+    # --- 
+
     def __scalar_product(self, u, v):
         """
-            Computes the dot product of vectors u and v,  
-            considering the weight:  
-            Σ₍i,j₎ uᵢ * WeightFunction(i,j) * vⱼ.
-            The vectors are expected as lists (or arrays), and indexing is 1-based.  
+        Computes the dot product of vectors **u** and **v**,  
+        considering the weight:  
+        Σ₍i,j₎ uᵢ * WeightFunction(i,j) * vⱼ.
+        The vectors are expected as lists (or arrays), and indexing is **1-based**.
+        
+        Computes u^T * W * v using a cached Weight Matrix.
+        Optimized to build the Weight matrix via vectorized integration.
         """
-        if len(u) != len(v):
+        u = np.asarray(u, dtype=np.float64)
+        v = np.asarray(v, dtype=np.float64)
+        dim = len(u)
+
+        if len(v) != dim:
             raise ValueError("Vectors have different dimensions.")
         
-        dim = len(u)
-        total = 0
-        for i in range(1, dim+1):
-            for j in range(1, dim+1):
-                total += u[i-1] * self.__weight_function(i, j) * v[j-1]
-        return total
+        # Verify that the W matrix is already built and has the correct shape
+        if not hasattr(self, '_W_matrix') or self._W_matrix.shape[0] != dim:          
+            # Retrieve the integration grid
+            x, w, _ = self.__get_integration_grid()
+            
+            # Evaluate the weight function
+            try:
+                w_vals = self.weight(x)
+                if np.isscalar(w_vals): w_vals = np.full_like(x, w_vals)
+            except:
+                w_vals = np.array([self.weight(val) for val in x])
+                
+            # Build the sine basis for the requested dimension
+            n_indices = np.arange(1, dim + 1, dtype=np.float64)
+            arg = np.outer(x, n_indices) * (self._pi / self.length)
+            B = np.sin(arg)
+            
+            # Perform integration using BLAS
+            norm_factor = 2.0 / self.length
+            weighted_B = B * (w * w_vals)[:, None]
+            W_matrix = (B.T @ weighted_B) * norm_factor
+            
+            # Store in cache while enforcing exact symmetry
+            self._W_matrix = 0.5 * (W_matrix + W_matrix.T)
+        
+        # Perform fast multiplication using BLAS
+        return u @ self._W_matrix @ v
     
-    # --- Construction of matrices D and D' (Equation (32) from [Pedran2008]). ---
+    # ----- Construction of matrices D and D' (Equation (32) from [Pedran2008]). -----
     
     # --- First
-    def __FirstBigMatrixProc(self, n, m):
-        """
-            Defines the element (n,m) of matrix D, according to Eq.(32) from [Pedran2008].  
-            For the diagonal case: returns n²·(π)²/L² + C(n,m);  
-            For the off-diagonal case: returns only C(n,m).  
-
-            Note: Since Maple uses 1-based indexing, we expect n and m to be positive integers here.
-        """
-        aux = self.__C(n, m)
-        if n == m:
-            return ((n**2 * (np.pi)**2) / (self.length**2)) + aux
-        else:
-            return aux
-
     def __FirstBigMatrix(self):
         """
-            Builds the matrix D (of order N x N) according to Eq.(32) from [Pedran2008],  
-            with elements defined by FirstBigMatrixProc(n,m). The matrix is symmetric.  
-            Returns a NumPy array.
+        Builds the matrix D (of order N x N) according to Eq.(32) from [Pedran2008].
+        Redirects to the ultra-fast vectorized construction.
         """
-        N = self.num_levels
-        M = np.zeros((N, N))
-        for i in range(N):
-            for j in range(i, N):
-                # Convert to 1-based indexes:
-                value = self.__FirstBigMatrixProc(i+1, j+1)
-                M[i, j] = value
-                M[j, i] = value
-        return M
+        return self.__build_matrix_d()
 
     def __SecondBigMatrix(self):
         """
-            Builds the matrix D' (of order N x N) according to Eq.(32), using the elements __C2.  
-            Returns a NumPy array (symmetric matrix).
+        Builds the D′ matrix (N × N) according to Eq. (32).
+        Redirects to the ultra-fast vectorized construction.
         """
-        N = self.num_levels
-        M = np.zeros((N, N))
-        for i in range(N):
-            for j in range(i, N):
-                value = self.__C2(i+1, j+1)
-                M[i, j] = value
-                M[j, i] = value
-        return M 
+        return self.__build_matrix_d_prime()
     
     # --- Second
     def __build_matrix_d(self):
         """
-            Builds the matrix D defined in Eq.(32) from [Pedran2008].  
-            For diagonal elements, uses: n²*(π)²/L² + C(n,n).  
-            For off-diagonal elements, uses: C(n,m),  
-            where C(n,m) is obtained from the integrals associated with function f.
+        Builds the D matrix (kinetic energy + f potential), defined in Eq. (32) of [Pedran2008], using a vectorized implementation.
         """
-        matrix_d = np.zeros((self.num_levels, self.num_levels))
-        for n in range(self.num_levels):
-            for m in range(self.num_levels):
-                # The calculation of C(n,m) is implemented in an auxiliary method (here, integrated into the __CIntegral function)
-                aux = self.__CIntegral(self.f_function, m+1, n+1)  # Using m+1 and n+1 because of the index in Maple (starting at 1)
-                if n == m:
-                    matrix_d[n, m] = (((n+1)**2 * (np.pi)**2)/(self.length**2)) + aux
-                else:
-                    matrix_d[n, m] = aux
+        N = self.num_levels
+        
+        # Obtém grade de integração 
+        x, w, _ = self.__get_integration_grid()
+        
+        # Avalia a função f(x)
+        try:
+            f_vals = self.f_function(x)
+            if np.isscalar(f_vals): f_vals = np.full_like(x, f_vals)
+        except:
+            f_vals = np.array([self.f_function(val) for val in x])
+            
+        # Constrói a Matriz de Base (Seno)
+        n_indices = np.arange(1, N + 1, dtype=np.float64)
+        arg = np.outer(x, n_indices) * (self._pi / self.length)
+        B = np.sin(arg)
+        
+        # Integração Numérica via Álgebra Linear (BLAS) 
+        norm_factor = 2.0 / self.length
+        weighted_B = B * (w * f_vals)[:, None]
+        matrix_d = (B.T @ weighted_B) * norm_factor
+        
+        # Adiciona o Termo Cinético na Diagonal
+        if self.length > 1e6:
+            pi_over_L = np.exp(np.log(self._pi) - np.log(self.length))
+        else:
+            pi_over_L = self._pi / self.length
+            
+        kinetic_term = (n_indices * pi_over_L) ** 2
+        np.fill_diagonal(matrix_d, matrix_d.diagonal() + kinetic_term)
+        
+        # Força Simetria exata (Remove flutuações de 1e-16 da máquina)
+        matrix_d = 0.5 * (matrix_d + matrix_d.T)
+        
         return matrix_d
 
     def __build_matrix_d_prime(self):
         """
-            Builds the matrix D′ defined in Eq.(32) from [Pedran2008],  
-            based on the integrals associated with function g.
+        Builds the D′ matrix (g potential), defined in Eq. (32) of [Pedran2008], using a vectorized implementation.
         """
-        matrix_d_prime = np.zeros((self.num_levels, self.num_levels))
-        for n in range(self.num_levels):
-            for m in range(self.num_levels):
-                matrix_d_prime[n, m] = self.__CIntegral(self.g_function, m+1, n+1)
-        return matrix_d_prime
-
-# --- Methods for Spectrum Calculation and Eigenvectors ---
-
-    def its_eigenvalues(self, *args):
-        """
-            Returns the calculated eigenvalue spectrum.  
+        N = self.num_levels
+        
+        # Obtém grade (Desempacota exatamente 3 valores)
+        x, w, _ = self.__get_integration_grid()
+        
+        # Avalia g(x)
+        try:
+            g_vals = self.g_function(x)
+            if np.isscalar(g_vals): g_vals = np.full_like(x, g_vals)
+        except:
+            g_vals = np.array([self.g_function(val) for val in x])
             
-            Args:
-            *args: int, slice, range, or list of ints in 1-based indexing.
-
-            Returns:
-                Single eigenvalues (if single int), or list of eigenvalues.
-
-            Examples:  
-                self.its_eigenvalues() : returns the complete list of eigenvalues.  
-                self.its_eigenvalues(1) : returns the 1st eigenvalue.  
-                self.its_eigenvalues(slice(1,4)) : returns the eigenvalues for levels 1, 2, and 3.  
-                self.its_eigenvalues(range(1,4)) : returns the eigenvalues for levels 1, 2, and 3.  
-                self.its_eigenvalues(1, 3, 5) : returns a list with the 1st, 3rd, and 5th eigenvalue.  
-
-            Use a slice or range object, for example: slice(1,4) or range(1,4).
-
-        """
-        if not self.has_spectrum_been_calculated:
-            self.calculate_spectrum_silently()
-
-        # If no arguments are passed, returns the full spectrum
-        if len(args) == 0:
-            return self.en_spectrum
+        # Base Seno
+        n_indices = np.arange(1, N + 1, dtype=np.float64)
+        arg = np.outer(x, n_indices) * (self._pi / self.length)
+        B = np.sin(arg)
         
-        # If only one argument was passed
-        elif len(args) == 1:
-            arg = args[0]
-            if isinstance(arg, int):
-                if arg <= 0:
-                    raise ValueError("Index must be a positive integer.")
-                return self.en_spectrum[arg - 1]
-            elif isinstance(arg, slice):
-                # Converts slice indexes from 1-based to 0-based:
-                start = arg.start - 1 if arg.start is not None else None
-                stop = arg.stop - 1 if arg.stop is not None else None
-                step = arg.step
-                return self.en_spectrum[start:stop:step]
-            elif isinstance(arg, range):
-                # Converts the indices of the range object (1-based) to 0-based.
-                return [self.en_spectrum[i - 1] for i in arg]
-            elif isinstance(arg, list):
-                # If a list of integers was passed: convert each index
-                return [self.en_spectrum[i - 1] for i in arg]
+        # Integração Vetorizada
+        norm_factor = 2.0 / self.length
+        weighted_B = B * (w * g_vals)[:, None]
+        matrix_d_prime = (B.T @ weighted_B) * norm_factor
+        
+        # Simetria
+        matrix_d_prime = 0.5 * (matrix_d_prime + matrix_d_prime.T)
+        
+        return matrix_d_prime
+    
+    # ----- Methods for Spectrum Calculation and Eigenvectors -----
+
+    @safe_execution
+    def is_solved(self, number_of_digits=None):
+        """
+        Solves the eigenvalue and eigenvector problem.
+        Updates precision if provided, tracks time, and reports status.
+
+            - If a value for number_of_digits (a positive integer) is provided, it updates the number of digits (precision) to be used in calculations.  
+
+            Procedure:  
+                1. Optional Updates self.num_digits with the provided value.  
+                2. Computes and times the spectrum (eigenvalues) by calling self.calculate_spectrum().  
+                3. Computes and times the eigenvectors by calling self.calculate_eigenvectors().  
+                4. Displays a final message indicating that the problem has been solved, including the number of digits used.  
+        """
+        # Update Precision if requested
+        if number_of_digits is not None:
+            if isinstance(number_of_digits, int) and number_of_digits > 0:
+                self.num_digits = number_of_digits
             else:
-                raise ValueError(f"Unsupported argument type: {type(arg)}. Use int, slice, range, or list of ints.")
-        
-        else:
-            # If multiple arguments are passed, it must be a sequence of integers
-            indices = []
-            for a in args:
-                if isinstance(a, int):
-                    indices.append(a)
-                else:
-                    raise ValueError(f"Unsupported argument type: {type(arg)}. Use int, slice, range, or list of ints.")
-            return [self.en_spectrum[i - 1] for i in indices]
+                raise ValueError("Number of digits must be a positive integer.")
 
-    def its_eigenvalues_silently(self, *args):
-        """
-            Silently retrieve eigenvalues. Typically used internally.
-            Args:
-            - args: Can be empty or a single positive integer.
-            Returns:
-            - List of eigenvalues or a specific eigenvalue.
-        """
-        if self.has_spectrum_been_calculated:
-            if len(args) == 1:
-                arg = args[0]
-                if isinstance(arg, int) and arg > 0:
-                    # Return the n-th eigenvalue
-                    return self.en_spectrum[arg - 1]  # Adjust for zero-based indexing
-            # Otherwise, return the whole spectrum
-            return self.en_spectrum
-        else:
-            raise RuntimeError("Spectrum hasn't been calculated yet. Please use a method to calculate it first.")
-        
+        # Helper to run and time a step (reduces repeated code blocks)
+        def run_step(name, check_flag, func):
+            if not check_flag:
+                print(f"Calculating {name} ...")
+                t0 = time.time()
+                func()
+                print(f"Time elapsed for {name} calculation: {time.time() - t0:.6f} seconds.")
+            else:
+                print(f"{name.capitalize()} already calculated. Skipping.")
+
+        # Execute Steps
+        run_step("eigenvalues", self.has_spectrum_been_calculated, self.calculate_spectrum)
+        run_step("eigenvectors", self.has_eigenvectors_been_calculated, self.calculate_eigenvectors)
+
+        # Final Report
+        self.calculator_name = "Python"
+        print("=" * 80)
+        print(f"The eigenvalue/eigenvector problem has been completely solved with {self.digits_used} digits used.")
+
+    @safe_execution
     def calculate_spectrum(self, save_to_file: bool = True):
         """
-            Computes the eigenvalue spectrum for the generalized eigenvalue problem,  
+        Computes the eigenvalue spectrum, prints status, and optionally saves to file.
+        Wraps the logic of calculate_spectrum_silently to avoid code duplication.
+
+        Computes the eigenvalue spectrum for the generalized eigenvalue problem,  
             solving A*v = λ*B*v, where A and B are the matrices D and D′  
             (built using the functions build_matrix_d() and build_matrix_d_prime(), respectively).  
 
@@ -455,42 +618,26 @@ class SpectralMethod:
             
             # digits is a symbolic indicator of precision control,
             # used to retry with simulated "increased effort"
-
         """
         screen_width = 80
         print("_" * screen_width)
-        print("Calculating energy eigenvalues (single attempt).")
+        print("Calculating energy eigenvalues...")
         print("_" * screen_width)
 
-        A = self.__build_matrix_d()
-        B = self.__build_matrix_d_prime()
-        
-        evs = eig(A, B, right=False)
+        # Calls the robust silent method to do the heavy lifting
+        self.calculate_spectrum_silently()
 
-        # Filters the eigenvalues, keeping only the real part if the imaginary part is negligible.
-        res = [u.real if np.isclose(u.imag, 0, atol=1e-12) else u for u in evs]
-        
-        #FILTER: remove inf, NaN and non-finite values
-        res = [r for r in res if np.isfinite(r)]
-
-        nroots = len(res)
-        
+        # Reporting
+        nroots = len(self.en_spectrum)
         if nroots != self.num_levels:
-            print(f"Warning: only {nroots} eigenvalues have been found, expected {self.num_levels}.")
-
-        number_complex = sum(1 for r in res if isinstance(r, complex))
-        if number_complex > 0:
-            print(f"Warning: {number_complex} eigenvalues have non-negligible imaginary parts.")
-
+            print(f"Warning: only {nroots} eigenvalues found, expected {self.num_levels}.")
+        
         print("Finished eigenvalue calculation.")
         print("_" * screen_width)
 
-        self.has_spectrum_been_calculated = True
-        self.en_spectrum = sorted(res)
-        
         # --- Save to File TXT ---
         if save_to_file:
-            filename = f"{self.root_filename}_Spectrum.txt"
+            filename = f"{self.root_filename}/{self.root_filename}_Spectrum.txt"
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(f"# {filename}\n")
                 f.write(f"# Program version : {self.version}\n")
@@ -504,9 +651,13 @@ class SpectralMethod:
 
         return self.en_spectrum
 
+    @safe_execution
     def calculate_spectrum_silently(self):
         """
-            Computes the eigenvalue spectrum silently, meaning without  
+        Core worker: Computes the eigenvalue spectrum (D*v = lambda*D'*v).
+        Includes logic to increase precision (digits) and retry if roots are complex or missing.
+
+        Computes the eigenvalue spectrum silently, meaning without  
             displaying messages to the user.  
 
             The method solves the generalized problem:  
@@ -526,43 +677,126 @@ class SpectralMethod:
 
             Returns:  
             An ordered list containing the eigenvalues.  
+
         """
         digits = self.num_digits
         digits_percent_increase = 0.1
-
+        
+        # Iterative loop to ensure numerical stability
         while True:
-            # Construction of matrices A and B
+            # Rebuild matrices (assumes build_matrix uses 'digits' or self.digits_used if updated)
+            
             A = self.__build_matrix_d()
             B = self.__build_matrix_d_prime()
 
-            # Eigenvalue calculation
+            # Eigenvalue calculation (right=False is faster if we only want spectrum)
             evs = eig(A, B, right=False)
-            
-            # Filters the eigenvalues, keeping only the real part if the imaginary part is negligible.
-            res = [u.real if np.isclose(u.imag, 0, atol=1e-12) else u for u in evs]
-            
-    
-            #FILTER: remove inf, NaN and non-finite values
-            res = [r for r in res if np.isfinite(r)]
+
+            # Filter: clean small imaginary parts and non-finites
+            res = []
+            has_complex = False
+            for u in evs:
+                if not np.isfinite(u): continue
+                if np.isclose(u.imag, 0, atol=1e-12):
+                    res.append(u.real)
+                else:
+                    res.append(u)
+                    has_complex = True
 
             nroots = len(res)
-            # Checks if the number of eigenvalues found is correct.
-            if nroots != self.num_levels or any(isinstance(r, complex) for r in res):
-                # Increases the precision and tries again.
+            
+            # Retry condition: wrong number of roots or presence of complex roots
+            if nroots != self.num_levels or has_complex:
+                # Increases precision and loops again
                 digits = int(digits * (1 + digits_percent_increase))
                 continue
             
+            # If execution reaches this point, the operation was successful
             break
 
-        # Stores the precision used, the spectrum, and marks that the calculation has been done.
+        # Final step
         self.digits_used = digits
-        self.has_spectrum_been_calculated = True
         self.en_spectrum = sorted(res)
+        self.has_spectrum_been_calculated = True
 
         return self.en_spectrum
 
+    @safe_execution
+    def its_eigenvalues(self, *args):
+        """
+        Returns the calculated eigenvalue spectrum with flexible indexing.
+        Supports: int, slice, range, or list of ints (1-based indexing).
+
+        Args:
+            *args: int, slice, range, or list of ints in 1-based indexing.
+
+            Returns:
+                Single eigenvalues (if single int), or list of eigenvalues.
+
+            Examples:  
+                self.its_eigenvalues() : returns the complete list of eigenvalues.  
+                self.its_eigenvalues(1) : returns the 1st eigenvalue.  
+                self.its_eigenvalues(slice(1,4)) : returns the eigenvalues for levels 1, 2, and 3.  
+                self.its_eigenvalues(range(1,4)) : returns the eigenvalues for levels 1, 2, and 3.  
+                self.its_eigenvalues(1, 3, 5) : returns a list with the 1st, 3rd, and 5th eigenvalue.  
+
+            Use a slice or range object, for example: slice(1,4) or range(1,4).
+
+        """
+        if not self.has_spectrum_been_calculated:
+            self.calculate_spectrum_silently()
+
+        # Case 0: No arguments -> Return full spectrum
+        if not args:
+            return self.en_spectrum
+
+        arg = args[0]
+
+        # Case 1: Multiple integers passed as args -> its_eigenvalues(1, 3, 5)
+        if len(args) > 1:
+            return [self.en_spectrum[i - 1] for i in args if isinstance(i, int)]
+
+        # Case 2: Single argument handling
+        if isinstance(arg, int):
+            if arg <= 0:
+                raise ValueError("Index must be a positive integer.")
+            return self.en_spectrum[arg - 1]
+        
+        elif isinstance(arg, slice):
+            # Convert 1-based slice to 0-based
+            start = arg.start - 1 if arg.start is not None else None
+            stop = arg.stop - 1 if arg.stop is not None else None
+            return self.en_spectrum[slice(start, stop, arg.step)]
+        
+        elif isinstance(arg, (range, list, tuple)):
+            # Handle list/range/tuple of indices
+            return [self.en_spectrum[i - 1] for i in arg]
+        
+        else:
+            raise ValueError(f"Unsupported argument type: {type(arg)}. Use int, slice, range, or list.")
+
+    @safe_execution
+    def its_eigenvalues_silently(self, *args):
+        """
+        Silently retrieve eigenvalues. Typically used internally.
+        Args:
+            - args: Can be empty or a single positive integer.
+            Returns:
+            - List of eigenvalues or a specific eigenvalue.
+        """
+        if not self.has_spectrum_been_calculated:
+             raise RuntimeError("Spectrum hasn't been calculated yet.")
+
+        if args and isinstance(args[0], int) and args[0] > 0:
+            return self.en_spectrum[args[0] - 1]
+        
+        return self.en_spectrum
+
+    @safe_execution
     def calculate_eigenvectors(self, save_to_file: bool = True):
         """
+        Computes eigenvalues AND eigenvectors.
+        Note: Even if spectrum was calculated, we must run eig(right=True) again to get vectors.
         Computes the eigenvectors for the generalized eigenvalue problem A*v = λ*B*v.
         After obtaining eigenvalues and eigenvectors (via scipy.linalg.eig), the results are
         sorted according to the eigenvalues, and each eigenvector is normalized so that
@@ -572,55 +806,66 @@ class SpectralMethod:
         and the flag self.has_eigenvectors_been_calculated is set to True.
         
         If save_to_file=True (Default), saves results in "<root_filename>_Eigenvectors.txt".
-
         """
+        # 1. Ensure spectrum is calculated first.
+        # This is crucial because calculate_spectrum determines the optimal 'digits'
+        # needed to avoid complex numbers. We want to use that same stability here.
         if not self.has_spectrum_been_calculated:
-            print("The energy spectrum hasn't been calculated yet.")
+            print("The energy spectrum hasn't been calculated yet. Calculating first to stabilize precision...")
             self.calculate_spectrum()
         
+        if self.has_eigenvectors_been_calculated:
+            print("Eigenvectors already calculated. Returning cached results.")
+            return self.eigenvectors
+
         print("_" * 80)
         print("Calculating energy eigenvectors now ...")
         
-        # Calculate eigenvalues and eigenvectors of the generalized eigenvalue problem
+        # 2. Build matrices (using the stable precision found in calculate_spectrum)
         A = self.__build_matrix_d()
         B = self.__build_matrix_d_prime()
         
+        # 3. Solve (right=True gets vectors)
         w, V = eig(A, B, right=True)
 
-        # Convert small imaginary parts to zero
+        # 4. Filter / Clean
         w = np.real_if_close(w, tol=1e-12)
         V = np.real_if_close(V, tol=1e-12)
 
-        # Sort eigenvalues and corresponding eigenvectors
+        # 5. Sort based on eigenvalues
         sorted_idx = np.argsort(w)
         w_sorted = w[sorted_idx]
         V_sorted = V[:, sorted_idx]
 
-        def normalize_eigenvector(vec, tol=1e-12):
-            """Normalize the eigenvector to have unit norm and first nonzero element positive."""
-            norm = self.__scalar_product(vec, vec)
-            if norm < tol:
-                return vec
-            vec = vec / np.sqrt(norm) 
-            first_nonzero_idx = np.argmax(np.abs(vec) > tol)
-            if vec[first_nonzero_idx] < 0:
-                vec = -vec
-            return vec
-
-        # Create normalized eigenvector list
+        # 6. Normalize
         eigenvectors = []
-        for i in range(V_sorted.shape[1]):
+        for i in range(self.num_levels):
+            # Safeguard in case w returns more roots than expected
+            if i >= len(w_sorted): break 
+            
             vec = V_sorted[:, i]
-            vec_normalized = normalize_eigenvector(vec)
-            eigenvectors.append([w_sorted[i], vec_normalized])  # keeps as ndarray
+            
+            # Normalization logic inline
+            norm = self.__scalar_product(vec, vec)
+            if norm > 1e-12:
+                vec = vec / np.sqrt(norm)
+                # Ensure first significant element is positive
+                first_nonzero = vec[np.argmax(np.abs(vec) > 1e-12)]
+                if first_nonzero < 0:
+                    vec = -vec
+            
+            eigenvectors.append([w_sorted[i], vec])
 
-        # Store the eigenvectors and mark the calculation as complete
+        # Store
         self.eigenvectors = eigenvectors
         self.has_eigenvectors_been_calculated = True
         
+        # Update spectrum logic too (consistency check)
+        self.en_spectrum = list(w_sorted[:self.num_levels])
+
         # --- Save to File ---
         if save_to_file:
-            filename = f"{self.root_filename}_Eigenvectors.txt"
+            filename = f"{self.root_filename}/{self.root_filename}_Eigenvectors.txt"
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(f"# {filename}\n")
                 f.write(f"# Program version : {self.version}\n")
@@ -628,9 +873,9 @@ class SpectralMethod:
                 f.write("# (1) Eigenvalue, (2) Eigenvector (full)\n")
                 f.write("# " + "="*80 + "\n")
                 for eigval, eigvec in eigenvectors:
-                    eigvec = np.array(eigvec).flatten()
-                    eigvec_str = "[" + ", ".join(f"{comp:.12e}" for comp in eigvec) + "]"
-                    f.write(f"{eigval:.12e}\t{eigvec_str}\n")
+                    # Optimized formatting for faster file writing
+                    vec_str = ", ".join(f"{x:.12e}" for x in eigvec.flatten())
+                    f.write(f"{eigval:.12e}\t[{vec_str}]\n")
 
             print(f"Eigenvectors saved to: {filename}")
             
@@ -639,114 +884,13 @@ class SpectralMethod:
         print("=" * 80)
 
         return eigenvectors
-      
-    def is_solved(self, number_of_digits=None):
-        """
-            Solves the eigenvalue and eigenvector problem.  
 
-            - If a value for number_of_digits (a positive integer) is provided, it updates the number of digits (precision) to be used in calculations.  
-
-            Procedure:  
-                1. Optional Updates self.num_digits with the provided value.  
-                2. Computes and times the spectrum (eigenvalues) by calling self.calculate_spectrum().  
-                3. Computes and times the eigenvectors by calling self.calculate_eigenvectors().  
-                4. Displays a final message indicating that the problem has been solved, including the number of digits used.  
-        """
-        if number_of_digits is not None:
-            if isinstance(number_of_digits, int) and number_of_digits > 0:
-                self.num_digits = number_of_digits
-            else:
-                raise ValueError("Number of digits must be a positive integer.")
-
-        # Check if spectrum and eigenvectors have already been calculated.
-        if not self.has_spectrum_been_calculated:
-            print("Calculating eigenvalues ...")
-            t0 = time.time()
-            self.calculate_spectrum()
-            elapsed = time.time() - t0
-            print(f"Time elapsed for eigenvalue calculation: {elapsed:.6f} seconds.")
-        else:
-            print("Eigenvalues already calculated. Skipping eigenvalue calculation.")
-
-        if not self.has_eigenvectors_been_calculated:
-            print("Calculating eigenvectors ...")
-            t0 = time.time()
-            self.calculate_eigenvectors()
-            elapsed = time.time() - t0
-            print(f"Time elapsed for eigenvector calculation: {elapsed:.6f} seconds.")
-        else:
-            print("Eigenvectors already calculated. Skipping eigenvector calculation.")
-
-        # Define the solver name.
-        self.calculator_name = "Python"
-        
-        print("=" * 80)
-        print(f"The eigenvalue/eigenvector problem has been completely solved with {self.digits_used} digits used.")
-    
-    def its_eigenvectors(self, *args):
-        """
-        Returns the computed eigenvectors (or a subset) in 1-based indexing.
-
-        Args:
-            *args: int, slice, range, or list of ints in 1-based indexing.
-
-        Returns:
-            Single eigenvector (if single int), or list of eigenvectors.
-            
-        Examples:
-            self.its_eigenvectors()             -> full list of eigenvectors
-            self.its_eigenvectors(1)            -> first eigenvector
-            self.its_eigenvectors(slice(1,4))   -> eigenvectors 1,2,3
-            self.its_eigenvectors(range(1,4))   -> eigenvectors 1,2,3
-            self.its_eigenvectors(1, 3, 5)      -> list [v1, v3, v5]
-        """
-        # ensure eigenvectors are computed
-        if not self.has_eigenvectors_been_calculated:
-            self.calculate_eigenvectors()
-
-        get_vector = lambda item: item[1]  # extracts only the vector v from [λ, v]
-
-        # no args: return all
-        if len(args) == 0:
-            return [get_vector(ev) for ev in self.eigenvectors]
-
-        elif len(args) == 1:
-            # int -> single vector
-            arg = args[0]
-            if isinstance(arg, int):
-                if arg <= 0:
-                    raise ValueError("Index must be a positive integer.")
-                return get_vector(self.eigenvectors[arg - 1])
-            
-            # slice -> subset
-            elif isinstance(arg, slice):
-                start = arg.start - 1 if arg.start is not None else None
-                stop = arg.stop - 1 if arg.stop is not None else None
-                step = arg.step
-                return [get_vector(ev) for ev in self.eigenvectors[start:stop:step]]
-            
-            # range or list -> multiple
-            elif isinstance(arg, range):
-                return [get_vector(self.eigenvectors[i - 1]) for i in arg]
-            elif isinstance(arg, list):
-                return [get_vector(self.eigenvectors[i - 1]) for i in arg]
-            else:
-                raise ValueError(f"Unsupported argument type: {type(arg)}. Use int, slice, range, or list of ints.")
-        else:
-            # multiple ints
-            indices = []
-            for a in args:
-                if isinstance(a, int):
-                    if a <= 0:
-                        raise ValueError("Indices must be positive integers.")
-                    indices.append(a)
-                else:
-                    raise ValueError(f"Unsupported argument type in multiple args: {type(a)}.")
-            return [get_vector(self.eigenvectors[i - 1]) for i in indices]
-
+    @safe_execution
     def its_eigenpairs(self, *args, save_to_file: bool = True):
         """
         Returns eigenvalue/eigenvector pairs (λ, v) in 1-based indexing.
+        Master function for data retrieval.
+        
         Optionally saves all results in a TXT file with column format.
 
         Args:
@@ -764,677 +908,621 @@ class SpectralMethod:
             self.its_eigenpairs(range(1,4))   -> same as above
             self.its_eigenpairs(1, 3, 5)      -> list with 1st, 3rd, and 5th pairs
         """
-
         if not self.has_eigenvectors_been_calculated:
             self.calculate_eigenvectors()
 
-        # Pair Selection
-        if len(args) == 0:
+        # Logic matches exactly what was done for eigenvalues, handling all cases.
+        if not args:
             result = self.eigenvectors
-        elif len(args) == 1:
+        else:
             arg = args[0]
-            if isinstance(arg, int):
-                if arg <= 0:
-                    raise ValueError("Index must be a positive integer.")
-                result = self.eigenvectors[arg - 1]
+            # Case: Multiple arguments passed -> its_eigenpairs(1, 3, 5)
+            if len(args) > 1:
+                indices = [i for i in args if isinstance(i, int)]
+                result = [self.eigenvectors[i - 1] for i in indices]
+            
+            # Case: Single argument
+            elif isinstance(arg, int):
+                if arg <= 0: raise ValueError("Index must be positive.")
+                result = self.eigenvectors[arg - 1] # Returns single pair [λ, v]
             elif isinstance(arg, slice):
                 start = arg.start - 1 if arg.start is not None else None
                 stop = arg.stop - 1 if arg.stop is not None else None
-                step = arg.step
-                result = self.eigenvectors[start:stop:step]
-            elif isinstance(arg, range):
-                result = [self.eigenvectors[i - 1] for i in arg]
-            elif isinstance(arg, list):
+                result = self.eigenvectors[slice(start, stop, arg.step)]
+            elif isinstance(arg, (list, tuple, range)):
                 result = [self.eigenvectors[i - 1] for i in arg]
             else:
-                raise ValueError(f"Unsupported argument type: {type(arg)}. Use int, slice, range, or list of ints.")
-        else:
-            indices = []
-            for a in args:
-                if isinstance(a, int):
-                    if a <= 0:
-                        raise ValueError("Indices must be positive integers.")
-                    indices.append(a)
-                else:
-                    raise ValueError(f"Unsupported argument type in multiple args: {type(a)}.")
-            result = [self.eigenvectors[i - 1] for i in indices]
+                raise ValueError(f"Unsupported argument type: {type(arg)}")
 
         # --- Save to File ---
         if save_to_file:
-            filename = f"{self.root_filename}_Eigenpairs.txt"
+            filename = f"{self.root_filename}/{self.root_filename}_Eigenpairs.txt"
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(f"# {filename}\n")
                 f.write(f"# Program version : {self.version}\n")
                 f.write("# (1) Eigenvalue, (2) Eigenvector (full)\n")
                 f.write("# " + "="*80 + "\n")
 
-                # Ensures we always have a list of pairs
-                if isinstance(result, list) and all(isinstance(r, (list, tuple)) and len(r) == 2 for r in result):
-                    pairs = result
-                else:
-                    pairs = [result]
+                # Normalize to list for iteration (handle single pair case)
+                # If result is [E, v] (single pair), wrap it in list -> [[E, v]]
+                # Check: List of lists/arrays?
+                pairs_to_write = [result] if (isinstance(result, list) and len(result) == 2 and isinstance(result[0], (int, float, complex))) else result
+                
+                # If it's a list of pairs (standard case)
+                if not isinstance(pairs_to_write, list): 
+                    # Fallback for slice causing ndarray or similar
+                    pairs_to_write = result
 
-                for eigval, eigvec in pairs:
-                    eigvec = np.array(eigvec).flatten()
-                    # Serializes the vector as a single string
-                    eigvec_str = "[" + ", ".join(f"{comp:.12e}" for comp in eigvec) + "]"
-                    line = f"{eigval:.12e}\t{eigvec_str}"
-                    f.write(line + "\n")
+                for eigval, eigvec in pairs_to_write:
+                    # Flatten and format string
+                    vec_str = "[" + ", ".join(f"{comp:.12e}" for comp in np.array(eigvec).flatten()) + "]"
+                    f.write(f"{eigval:.12e}\t{vec_str}\n")
 
             print(f"Eigenpairs saved in: {filename}")
 
         return result
 
-    def its_eigenfunction(self, x, i, tolerance=1e-15):
+    @safe_execution
+    def its_eigenvectors(self, *args):
         """
-            Returns the i-th normalized eigenfunction.  
-
-                - If x is numeric (i.e., an instance of `numbers.Number`), it uses NumPy.  
-                - Otherwise, it treats x as symbolic and constructs the expression using SymPy.  
-
-                The eigenfunction is defined as:  
-                        ψ_i(x) = sqrt(2/L) * Σₘ₌₁^N [aₘ * sin(m π x / L)]
-
-                where:  
-                - L = self.length  
-                - N = number of eigenvector coefficients (eigenstates)  
-                - aₘ are the coefficients of the corresponding eigenvector  
-
-                Args:  
-                - x: Numeric value of x or string (e.g., "x").  
-                - i: Level (1,2,3...).  
-                - tolerance: Coefficients smaller than this value will be ignored.  
-
-                Returns:  
-                - If x is numeric (x=0.5): A numeric value.  
-                - If x is a string ("x"): A SymPy expression.  
-
-        """
-        try:
-            L = self.length
-            N = self.num_levels 
-        except:
-            print("The attributes: length and levels were not found. Define them and try again.")
-        try:
-            coeffs = self.eigenvectors[i - 1][1]
-        except:
-            print("Eigenvectors not found. Compute them and try again.")
-        
-        if isinstance(x, (numbers.Number, np.ndarray)):
-            # Ensure that x is converted to a 1D array.
-            x_arr = np.atleast_1d(x).astype(float)
-            
-            # Convert the coefficients to a NumPy array:
-            a = np.array(coeffs, dtype=float)
-            m = np.arange(1, N + 1, dtype=float)
-            
-            # Filter insignificant coefficients:
-            mask = np.abs(a) > tolerance
-            if np.any(mask):
-                a = a[mask]
-                m = m[mask]
-            
-            # Compute sin(m * π * x / L) such that m is treated as a column:
-            sin_term = np.sin(m[:, np.newaxis] * np.pi * x_arr / L)
-            # Sum over the m axis:
-            result = np.sqrt(2 / L) * np.sum(a[:, np.newaxis] * sin_term, axis=0)
-            
-            # If the input was a scalar, return a scalar:
-            if result.size == 1:
-                return result.item()
-            else:
-                return result
-        else:
-            # Symbolic branch: convert x to a Sympy object.
-            x_sym = sp.sympify(x)
-            # If self.length is a NumPy array, extract the scalar value:
-            if isinstance(L, np.ndarray):
-                L = L.item()
-            L_sym = sp.Float(L)
-            
-            coeffs_sym = [sp.Float(c) for c in coeffs]
-            psi_expr = sp.sqrt(2 / L_sym) * sp.Add(*[
-                coeffs_sym[m - 1] * sp.sin(m * sp.pi * x_sym / L_sym)
-                for m in range(1, N + 1)
-                if abs(coeffs_sym[m - 1]) > tolerance
-            ])
-            return psi_expr
-
-    def an_eigenfunction(self, x, basis_coeffs):
-            """
-            Individual eigenfunction.
-            Evaluate the eigenfunction ψ(x) from the coefficients in the sine basis.
-
-            The eigenfunction is expanded as:
-
-                ψ(x) = sqrt(2 / L) * Σ_{m=1}^N coeffs[m-1] * sin(m * π * x / L)
-
-            Parameters
-                x : float or array_like
-                    Position or positions at which to evaluate ψ(x).
-                coeffs : array_like, shape (N_basis,)
-                    Basis coefficients (components of the eigenvector).
-                    Coefficients c₁ … c_N are computed in `CalculateEigenVectors`.
-                L : float
-                    Length of the domain.
-
-            Returns
-
-                float or ndarray
-                    Value(s) of ψ(x). If x is a scalar, returns a scalar.
-                    If `x` is an array, returns an array.
-        """
-
-            # Recover L
-            L = getattr(self, "L_optimal", None) or getattr(self, "length", None)
-            if L is None:
-                raise AttributeError("I did not find 'L_optimal' nor 'length' in the instance.")
-
-            # Convert coefficients and build index m = [1, 2, …, N]
-            c = np.asarray(basis_coeffs).flatten()
-            m = np.arange(1, c.size + 1)
-
-            # Convert x to an array (supports float or array input).
-            x_arr = np.atleast_1d(x)
-
-            # φₘ(x) = sin(m·π·x/L) for each m and each x
-            # resulting in φ shape : (N_basis, len(x_arr))
-            phi = np.sin(np.pi * m[:, None] * x_arr[None, :] / L)
-
-            # Linear combination + factor √(2/L)
-            psi_vals = np.sqrt(2.0 / L) * (c[:, None] * phi).sum(axis=0)
-
-            # If the input is a scalar, a scalar is returned.
-            return psi_vals[0] if np.isscalar(x) else psi_vals
-
-    def wave_function(self, x, t, coefficients, tolerance=1e-15, normalize=True, save_to_file=False):
-        """
-        Constructs the wave function ψ(x, t) as a linear combination of eigenfunctions
-        for given x and time t, using the list of coefficients.
-
-        Normalization is performed with respect to the weighted norm:
-            ∫ |ψ(x, t)|² * w(x) dx
-
-        Returns:
-            - Symbolic expression if x and/or t are symbolic.
-            - Numerical value if x and t are numerical.
-        
-        Example:
-            x = np.linspace(0, 1, 200)
-            t = np.linspace(0, 1, 50)
-            psi_vals = p.wave_function(x, t, coeficientes)
-            
-        """
-
-        if not self.has_eigenvectors_been_calculated:
-            raise RuntimeError("Eigenvectors haven't been calculated yet.")
-                
-        # Validate number of coefficients
-        if len(coefficients) != self.num_levels:
-            raise ValueError(f"Expected {self.num_levels} coefficients, got {len(coefficients)}.")
-
-        # --- numeric case ---
-        if (isinstance(x, (numbers.Number, np.generic, list, np.ndarray)) and
-            (isinstance(t, (numbers.Number, np.generic, list, np.ndarray)))):
-
-            # Ensures arrays
-            x_vals = np.atleast_1d(x)
-            t_vals = np.atleast_1d(t)
-
-            results = np.zeros((len(t_vals), len(x_vals)), dtype=complex)
-
-            for j, tj in enumerate(t_vals):
-                psi_total = 0
-                for i in range(self.num_levels):
-                    if abs(coefficients[i]) > tolerance:
-                        eigenvalue = self.eigenvectors[i][0]
-                        psi_n_x = self.its_eigenfunction(x_vals, i + 1, tolerance)
-                        psi_total += coefficients[i] * psi_n_x * np.exp(1j * eigenvalue * tj)
-
-                if normalize:
-                    integrand = lambda x_: np.abs(self.wave_function(x_, tj, coefficients, normalize=False))**2 * self.weight(x_)
-                    norm_squared = fixed_quad(integrand, 0, self.length, n=1000)[0]
-                    psi_total = psi_total / np.sqrt(norm_squared)
-
-                results[j, :] = psi_total
-
-            # --- save to a TXT file ---
-            if save_to_file:
-                filename = f"{self.root_filename}_WaveFunction.txt"
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write(f"# {filename}\n")
-                    f.write(f"# Program version : {self.version}\n")
-                    f.write(f"# Date: {datetime.datetime.now().strftime('%c')}\n")
-                    f.write("# Columns: x\t t\t Psi(x,t)\n")
-                    f.write("# " + "="*60 + "\n")
-
-                    for j, tj in enumerate(t_vals):
-                        for xi, psi in zip(x_vals, results[j, :]):
-                            f.write(f"{xi:.6f}\t{tj:.6f}\t{psi:.12e}\n")
-                            
-                print(f"Wave function saved to: {filename}")
-
-            # If it is a scalar, it returns a scalar; if it is an array, it returns a matrix.
-            if np.ndim(x) == 0 and np.ndim(t) == 0:
-                return results[0,0]
-            elif np.ndim(t) == 0:
-                return results[0,:]
-            elif np.ndim(x) == 0:
-                return results[:,0]
-            else:
-                return results
-
-        # --- symbolic case ---
-        else:
-            x_sym = sp.sympify(x)
-            t_sym = sp.sympify(t)
-            psi_expr = 0
-            for i in range(self.num_levels):
-                if abs(coefficients[i]) > tolerance:
-                    eigenvalue = self.eigenvectors[i][0]
-                    psi_n_x = self.its_eigenfunction(x_sym, i + 1, tolerance)
-                    psi_expr += coefficients[i] * psi_n_x * sp.exp(sp.I * eigenvalue * t_sym)
-            
-            # Default symbolic normalization (excluding the weight).
-            norm = sp.sqrt(sum(sp.Abs(c)**2 for c in coefficients))
-            if norm == 0:
-                return 0
-            return psi_expr / norm
-    
-    def probability_density(self, x, t, coefficients, simplify_expr=False, save_to_file=False):
-        """
-        Returns the probability density |ψ(x,t)|² for position x, time t,
-        and the coefficients of the linear combination.
+        Returns the computed eigenvectors (or a subset) in 1-based indexing.
+        Wrapper around its_eigenpairs to avoid code duplication.
 
         Args:
-            x : float, array-like ou simbólico
-                Posição.
-            t : float, array-like ou simbólico
-                Tempo.
-            coefficients (list): Coeficientes (tamanho igual a self.num_levels).
-            simplify_expr (bool): Se True, aplica sp.simplify à expressão simbólica.
-            save_to_file (bool): Se True, salva os resultados em arquivo TXT.
+            *args: int, slice, range, or list of ints in 1-based indexing.
 
         Returns:
-            - Se x e/ou t forem simbólicos, retorna expressão SymPy.
-            - Caso contrário, retorna valores numéricos (float, vetor ou matriz).
-        
-        Example:
-            x = np.linspace(0, 1, 200)
-            t = np.linspace(0, 1, 50)
-            rho_vals = p.probability_density(x, t, coeficientes)
-        """
-
-        # Validates the number of coefficients.
-        if len(coefficients) != self.num_levels:
-            raise ValueError(f"Expected {self.num_levels} coefficients, got {len(coefficients)}.")
-
-        psi = self.wave_function(x, t, coefficients)
-
-        # --- Symbolic case ---
-        if isinstance(psi, sp.Basic):
-            result = sp.Abs(psi)**2
-            result = sp.simplify(result) if simplify_expr else result
-            return result
-
-        # --- Numerical case ---
-        else:
-            result = np.abs(psi)**2
-
-            # --- save to a TXT file ---
-            if save_to_file:
-                filename = f"{self.root_filename}_ProbabilityDensity.txt"
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write(f"# {filename}\n")
-                    f.write(f"# Program version : {self.version}\n")
-                    f.write(f"# Date: {datetime.datetime.now().strftime('%c')}\n")
-                    f.write("# Columns: x\t t\t |Psi(x,t)|²\n")
-                    f.write("# " + "="*60 + "\n")
-
-                    x_vals = np.atleast_1d(x)
-                    t_vals = np.atleast_1d(t)
-
-                    # If both are arrays, it generates a complete table.
-                    if x_vals.ndim == 1 and t_vals.ndim == 1:
-                        for j, tj in enumerate(t_vals):
-                            row = result[j, :] if result.ndim == 2 else result
-                            for xi, rho in zip(x_vals, row):
-                                f.write(f"{xi:.6f}\t{tj:.6f}\t{rho:.12e}\n")
-
-                    # If x is an array and t is a scalar.
-                    elif x_vals.ndim == 1 and t_vals.size == 1:
-                        for xi, rho in zip(x_vals, result):
-                            f.write(f"{xi:.6f}\t{t_vals[0]:.6f}\t{rho:.12e}\n")
-
-                    # If x is a scalar and t is an array.
-                    elif t_vals.ndim == 1 and x_vals.size == 1:
-                        for tj, rho in zip(t_vals, result):
-                            f.write(f"{x_vals[0]:.6f}\t{tj:.6f}\t{rho:.12e}\n")
-
-                    # If both are scalars.
-                    else:
-                        f.write(f"{x_vals[0]:.6f}\t{t_vals[0]:.6f}\t{result:.12e}\n")
-                
-                print(f"Probability density saved to: {filename}")
+            Single eigenvector (if single int), or list of eigenvectors.
             
-            return result
- 
+        Examples:
+            self.its_eigenvectors()             -> full list of eigenvectors
+            self.its_eigenvectors(1)            -> first eigenvector
+            self.its_eigenvectors(slice(1,4))   -> eigenvectors 1,2,3
+            self.its_eigenvectors(range(1,4))   -> eigenvectors 1,2,3
+            self.its_eigenvectors(1, 3, 5)      -> list [v1, v3, v5]
+        """
+        # Reuse logic from its_eigenpairs
+        pairs = self.its_eigenpairs(*args, save_to_file=False)
+
+        # Extract just the vectors (v) from [λ, v]
+        
+        # Case A: Single pair returned (args was a single int)
+        # Check: [scalar, vector] structure
+        if isinstance(pairs, list) and len(pairs) == 2 and isinstance(pairs[0], (int, float, complex)):
+             return pairs[1]
+
+        # Case B: List of pairs returned (slice, range, or no args)
+        return [p[1] for p in pairs]
+
+    @safe_execution
+    def its_eigenfunction(self, x, i, tolerance=1e-15):
+        """
+        Returns the i-th normalized eigenfunction (ψ_i).
+
+            ψ_i(x) = sqrt(2/L) * Σₘ₌₁^N [aₘ * sin(m π x / L)]
+
+        - Numeric x: Uses vectorized NumPy calculation (via an_eigenfunction).
+        - Symbolic x: Returns a SymPy expression.
+
+        Args:
+            x (float, array, str, sympy.Symbol): Position(s).
+            i (int): Quantum level (1-based index).
+            tolerance (float): Threshold to ignore negligible coefficients (optimization).
+
+        Returns:
+            float, np.ndarray, or sympy.Expr
+        """
+        # Validate Attributes
+        if not hasattr(self, 'length') or not hasattr(self, 'num_levels'):
+            raise AttributeError("Attributes 'length' and 'num_levels' are missing.")
+        
+        # Get Coefficients for level i
+        if not hasattr(self, 'eigenvectors') or not self.eigenvectors:
+             # Try to calculate if missing, or raise error
+            raise ValueError("Eigenvectors not found. Please run solve() first.")
+        
+        # Extract vector part (v) from [E, v]
+        coeffs = self.eigenvectors[i - 1][1]
+
+        # Numeric Path 
+        if isinstance(x, (numbers.Number, np.ndarray, list)):
+            return self.an_eigenfunction(x, coeffs, tolerance=tolerance)
+
+        # Symbolic Path (SymPy)
+        return self._symbolic_eigenfunction(x, coeffs, tolerance)
+
+    @safe_execution
+    def an_eigenfunction(self, x, basis_coeffs, tolerance=0.0):
+        """
+        Calculates ψ(x) numerically given specific basis coefficients.
+        
+        Physics: Represents the expansion in the Infinite Well basis (sine basis).
+        Domain: 0 <= x <= L. Returns 0 outside this domain if enforcing physics.
+
+        Args:
+            x (float or array_like): Positions.
+            basis_coeffs (array_like): Eigenvector coefficients (a_m).
+            tolerance (float): Coefficients with absolute value < tolerance are ignored.
+
+        Returns:
+            float or np.ndarray: The wavefunction value(s).
+        """
+        L = self.length
+        
+        # Prepare Inputs
+        x_arr = np.atleast_1d(x).astype(float)
+        coeffs = np.asarray(basis_coeffs, dtype=float)
+        
+        # Filter small coefficients to reduce matrix operations
+        m_indices = np.arange(1, len(coeffs) + 1)
+        
+        if tolerance > 0:
+            mask_c = np.abs(coeffs) > tolerance
+            if not np.any(mask_c): return np.zeros_like(x_arr) if x_arr.size > 1 else 0.0
+            coeffs = coeffs[mask_c]
+            m_indices = m_indices[mask_c]
+
+        # Calculation: ψ(x) = sqrt(2/L) * Σ a_m * sin(m*π*x/L)
+        # Note: (m * pi / L) is computed once per m
+        args = np.outer(m_indices, x_arr) * (np.pi / L) 
+        basis_values = np.sin(args)
+        
+        # Dot product: sum(coef * sin) over the 'm' axis
+        psi_values = np.sqrt(2.0 / L) * np.dot(coeffs, basis_values)
+
+        # Physics Enforce: Boundary Conditions
+        # The particle cannot exist outside [0, L]. The sine function repeats, 
+        # so we manually zero out values outside the box.
+        outside_domain = (x_arr < 0) | (x_arr > L)
+        if np.any(outside_domain):
+            psi_values[outside_domain] = 0.0
+
+        # Return scalar if input was scalar
+        if np.ndim(x) == 0:
+            return psi_values.item()
+        return psi_values
+
+    # --- Helper method for symbolic eigenfunction 
+    def _symbolic_eigenfunction(self, x_str, coeffs, tolerance):
+        """Helper to handle the slow SymPy construction separately."""
+        x_sym = sp.sympify(x_str)
+        L_sym = sp.Float(self.length)
+        
+        # Build terms generator
+        terms = []
+        const_factor = sp.sqrt(2 / L_sym)
+        
+        for m_idx, c_val in enumerate(coeffs):
+            if abs(c_val) > tolerance:
+                m = m_idx + 1
+                term = sp.Float(c_val) * sp.sin(m * sp.pi * x_sym / L_sym)
+                terms.append(term)
+        
+        return const_factor * sp.Add(*terms)
+
+    @safe_execution
+    def wave_function(self, x, t, coefficients, tolerance=1e-15, normalize=True, save_to_file=False):
+        """
+        Constructs ψ(x, t) efficiently using matrix operations.
+        
+        Physics:
+            ψ(x, t) = Σ c_n * ψ_n(x) * exp(-i * E_n * t)
+            
+        Optimization:
+            - Vectorized over Space (x), Time (t), and Levels (n).
+            - Avoids re-integrating normalization at every time step (relies on unitarity).
+        """
+        # Validation
+        if not self.has_eigenvectors_been_calculated:
+            raise RuntimeError("Eigenvectors haven't been calculated yet.")
+        if len(coefficients) != self.num_levels:
+            raise ValueError(f"Expected {self.num_levels} coeffs, got {len(coefficients)}.")
+
+        # 2. Normalize Coefficients Once (Conservation of Probability)
+        # Assuming the basis set is orthonormal, we only need to normalize the vector c.
+        coeffs = np.array(coefficients, dtype=complex)
+        if normalize:
+            norm_c = np.linalg.norm(coeffs)
+            if not np.isclose(norm_c, 0):
+                coeffs = coeffs / norm_c
+
+        # --- Numeric Case ---
+        if isinstance(x, (numbers.Number, np.ndarray, list)) and \
+           isinstance(t, (numbers.Number, np.ndarray, list)):
+            
+            x_vals = np.atleast_1d(x)
+            t_vals = np.atleast_1d(t)
+            
+            # A. Pre-calculate Spatial Basis Matrix (Levels x Space)
+            psi_space_matrix = np.zeros((self.num_levels, len(x_vals)), dtype=float)
+            
+            # Only calculate levels with significant coefficients
+            active_indices = np.where(np.abs(coeffs) > tolerance)[0]
+            
+            for i in active_indices:
+                eig_vec = self.eigenvectors[i][1] # Get vector part
+                psi_space_matrix[i, :] = self.an_eigenfunction(x_vals, eig_vec, tolerance)
+
+            # B. Pre-calculate Temporal Phasors Matrix (Time x Levels)
+            energies = np.array([self.eigenvectors[i][0] for i in range(self.num_levels)])
+            
+            phasors = np.exp(-1j * np.outer(t_vals, energies)) 
+
+            # C. Combine: Psi(t, x) = (Phasors * Coeffs) @ Psi_Space
+            # (Num_T, Num_Levels) * (Num_Levels,) -> (Num_T, Num_Levels) weighted
+            # (Num_T, Num_Levels) @ (Num_Levels, Num_X) -> (Num_T, Num_X)
+            weighted_phasors = phasors * coeffs[None, :] # Broadcast coefficients
+            psi_grid = weighted_phasors @ psi_space_matrix
+
+            # D. File I/O (Delegated to helper or inline if strictly necessary)
+            if save_to_file:
+                self._save_wavefunction(x_vals, t_vals, psi_grid)
+
+            # E. Return shape handling
+            return np.squeeze(psi_grid)
+
+        # --- Symbolic Case ---
+        else:
+            return self._symbolic_wave_function(x, t, coeffs, tolerance)
+
+    def _symbolic_wave_function(self, x, t, coefficients, tolerance):
+        """Helper for symbolic construction."""
+        x_sym = sp.sympify(x)
+        t_sym = sp.sympify(t)
+        psi_expr = 0
+        
+        # Normalize coefficients symbolically
+        norm = sp.sqrt(sum(sp.Abs(c)**2 for c in coefficients))
+        
+        for i, c in enumerate(coefficients):
+            if abs(c) > tolerance:
+                E = self.eigenvectors[i][0]
+                psi_n = self.its_eigenfunction(x_sym, i + 1, tolerance)
+                # Note: Physics convention exp(-iEt)
+                psi_expr += (c/norm) * psi_n * sp.exp(-sp.I * E * t_sym)
+                
+        return psi_expr
+
+    @safe_execution
+    def probability_density(self, x, t, coefficients, simplify_expr=False, save_to_file=False):
+        """
+        Calculates |ψ(x,t)|². Efficient wrapper around wave_function.
+        """
+        psi = self.wave_function(x, t, coefficients, normalize=True, save_to_file=False)
+
+        # Symbolic
+        if isinstance(psi, sp.Basic):
+            rho = sp.Abs(psi)**2
+            return sp.simplify(rho) if simplify_expr else rho
+        
+        # Numeric
+        rho = np.abs(psi)**2
+        
+        if save_to_file:
+            # Reusing the logic
+            self._save_density(x, t, rho)
+            
+        return rho
+
     def normalize_eigenvector(self, u):
         """
-            Normalizes an eigenvector (list or array) according to the definition of the dot product.  
-
-            Args:  
-            - u (list or array-like): Vector containing the eigenvector components.  
-
-            Returns:  
-            - numpy.array: Normalized vector.  
+        Normalizes a vector u based on the scalar product defined in the class.
         """
         u = np.asarray(u)
-        
         if u.ndim != 1:
-            raise ValueError("The eigenvector must be a 1D array or list.")
+            raise ValueError("Eigenvector must be 1D.")
 
-        # Compute the norm (inner product).
-        norm_factor = np.sqrt(self.__scalar_product(u,u))
-        # Check whether the norm is close to zero (in which case normalization is not meaningful).
+        # Compute norm squared <u|u>
+        norm_sq = self.__scalar_product(u, u)
         
-        if np.isclose(norm_factor, 0, atol=1e-15):
-            return u  # Returns the original vector if the norm is zero (or nearly zero).
-        # Normalize the vector.
-        return u / norm_factor
+        # Avoid division by zero and sqrt of negative (precision errors)
+        if np.isclose(norm_sq, 0, atol=1e-15):
+            return u
+            
+        return u / np.sqrt(np.abs(norm_sq))
 
+    @safe_execution
     def norm_of_wave_function(self, coefficients):
         """
-            Returns a function norm_func(t) that calculates the norm of the wave function,  
-            which is the integral (over x from 0 to L) of the term:  
-
-            ProbabilityDensity(x, t, coefficients) * w(x)
-
-            where w(x) is the defined weight function.  
-
-            Args:  
-            - coefficients (list): Coefficients of the linear combination (as in `wave_function`).  
-
-            Returns:  
-            - A function norm_func(t) that returns the numerical value of the integral.  
-
-        """
-        # Check if the coefficients are valid
-        if not isinstance(coefficients, (list, np.ndarray)):
-            raise ValueError("Coefficients must be a list or array.")
+        Returns a function norm_func(t) to check the norm preservation.
         
-        # Validate that we have the right number of coefficients
-        if len(coefficients) != self.num_levels:
-            raise ValueError(f"Expected {self.num_levels} coefficients, got {len(coefficients)}.")
+        Physics Note:
+        For a Hermitian Hamiltonian, this value should be constant (approx 1.0) over time.
+        Any deviation indicates numerical error or a non-Hermitian system.
+        """
+        coeffs = np.asarray(coefficients)
+        # Pre-normalize coefficients so the expected result is 1.0
+        coeffs = coeffs / np.linalg.norm(coeffs)
 
-        # Define the function norm_func(t)
         def norm_func(t):
-            # Performs integration with respect to x.
-            integral, err = fixed_quad(lambda x: self.probability_density(x, t, coefficients) * self.weight(x), 0.0, self.length, n=10000)
-          
-            return integral
-        
-        return norm_func
-    
-    # --- Plot Methods for WaveFunction and Probability Density ---
-    
-    def plot_wavefunctions(self, num_levels: int = None, levels: list[int] = None, x_points: int = 800, show: bool = True, save: bool = True):
-        """
-            Plot the eigenfunctions ψₙ(x) for the selected energy levels.
-            Each ψₙ(x) is constructed using all components of its eigenvector.
+            # We integrate |Psi(x,t)|^2 * w(x) dx
+            
+            def integrand(x_Pos):
+                # We calculate density at a single time t for varying x
+                rho = self.probability_density(x_Pos, t, coeffs, save_to_file=False)
+                # Handle potential weight function
+                w = self.weight(x_Pos) if hasattr(self, 'weight') else 1.0
+                return rho * w
 
-            Parameters
-                num_levels : int, optional
-                    If set, plots the first `num_levels` levels (n = 0 … num_levels–1).
-                levels : list of int, optional
-                    Specific 1-based indices of levels to plot (e.g., [1, 3, 5]).
-                    If provided, `num_levels` is ignored.
-                x_points : int
-                    Number of x points used to evaluate ψₙ(x).
-                save_path : str or None
-                    If provided, saves the figure to this file.
-                show : bool
-                    If True, displays the plot; otherwise, only saves and closes it.
-        """
-        save_path = f"{self.root_filename}_wavefunctions.png"
+            result, _ = fixed_quad(integrand, 0.0, self.length, n=5e3)
+            return result
+
+        return norm_func
+
+    # --- Helper methods for clean I/O 
+    def _save_wavefunction(self, x, t, psi_data):
+        # Ensure the directory exists
+        if not os.path.exists(self.root_filename):
+            os.makedirs(self.root_filename, exist_ok=True)
+            
+        filename = os.path.join(self.root_filename, "WaveFunction.txt")
+        print(f"Saving to {filename}...")
         
-        # Decide which 1-based indices to use
+        # Create a coordinate grid for each data point
+        # T_grid, X_grid = np.meshgrid(t, x, indexing='ij') 
+        rows, cols = psi_data.shape # (Time, Space)
+        
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"# {filename}\n# Date: {datetime.datetime.now()}\n")
+            f.write("# x\t t\t Real(Psi)\t Imag(Psi)\t Abs(Psi)\n" + "-"*60 + "\n")
+            
+            # Loop only over time, using block writing or vectorized row-by-row writing
+            for j in range(rows): # For each time step
+                curr_t = t[j]
+                curr_psi = psi_data[j, :] # Entire spatial slice
+                
+                # Build a temporary matrix to save this time block
+                # Colums: x, t, real, imag, abs
+                data_block = np.column_stack((
+                    x, 
+                    np.full_like(x, curr_t), 
+                    curr_psi.real, 
+                    curr_psi.imag, 
+                    np.abs(curr_psi)
+                ))
+                
+                np.savetxt(f, data_block, fmt='%.6f\t%.6f\t%.6e\t%.6e\t%.6e')
+
+    def _save_density(self, x, t, rho_data):
+        """
+        Implementation of the missing method to save probability density.
+        """
+        if not os.path.exists(self.root_filename):
+            os.makedirs(self.root_filename, exist_ok=True)
+
+        filename = os.path.join(self.root_filename, "ProbabilityDensity.txt")
+        print(f"Saving to {filename}...")
+        
+        rows, cols = rho_data.shape # (Time, Space)
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"# {filename}\n# Date: {datetime.datetime.now()}\n")
+            f.write("# x\t t\t Density(|Psi|^2)\n" + "-"*60 + "\n")
+            
+            for j in range(rows):
+                curr_t = t[j]
+                curr_rho = rho_data[j, :]
+                
+                # Build block: X, T, Rho
+                data_block = np.column_stack((
+                    x,
+                    np.full_like(x, curr_t),
+                    curr_rho
+                ))
+                
+                np.savetxt(f, data_block, fmt='%.6f\t%.6f\t%.6e')
+    # ---
+
+    # ----- Plot Methods for WaveFunction and Probability Density ---
+
+    @safe_execution
+    def plot_eigenfunctions(self, num_levels: int = None, levels: list[int] = None, x_points: int = 800, save: bool = True, save_txt: bool = True):
+        """
+        Plots the stationary eigenfunctions ψ_n(x) and saves the data.
+        """
+
+        # Argument validation
+        img_save_path = f"{self.root_filename}/{self.root_filename}_eigenfunctions.png"
+        
         if levels is not None:
             idx = levels
         elif num_levels is not None:
-            if num_levels < 1:
-                raise ValueError("`num_levels` deve ser >= 1.")
+            if num_levels < 1: raise ValueError("`num_levels` must be >= 1.")
             idx = list(range(1, num_levels + 1))
         else:
-            raise ValueError("Forneça `num_levels` ou `levels`.")
+            raise ValueError("Provide `num_levels` or `levels`.")
 
-        # Extract pairs (λₙ, vₙ) via its_eigenpairs
+        # Retrieve (Energy, Vector) pairs
         pairs = self.its_eigenpairs(*idx)
-        # Normalize to a list.
-        if not isinstance(pairs, list):
+        if not isinstance(pairs, list): 
             pairs = [pairs]
 
-        # Domain in x.
+        # Domain definition
         L = getattr(self, "length", None) or getattr(self, "L_optimal", None)
-        if L is None:
-            raise AttributeError("Define 'self.length' before plotting.")
+        if L is None: raise AttributeError("Set `self.length` before plotting.")
+        
+        # Domain vectorization
         x = np.linspace(0.0, L, x_points)
 
-        # Plot each energy level
         plt.figure(figsize=(8, 5))
+        print(f"--- Processing {len(idx)} levels ---")
+        
+        # Plotting and saving loop
         for level, (eigval, vec) in zip(idx, pairs):
-            psi_n = self.an_eigenfunction(x, vec)
-            n = level - 1
-            plt.plot(x, psi_n.real, label=f"ψₙ (n={n})")
+            psi_complex = self.an_eigenfunction(x, vec)
+            psi_n = psi_complex.real # Real part for 1D plotting
+            
+            n = level - 1 # Physical index (0, 1, 2, ...)
+            
+            # Plot
+            plt.plot(x, psi_n, label=f"$\psi_{{{n}}}$ (E={eigval:.4f})")
 
-        # Apply final decorations (labels, titles, legends, etc.).
-        plotted = [i - 1 for i in idx]
-        plt.title(f"Eigenfunctions ψₙ(x) — Levels {plotted}")
-        plt.xlabel("x")
-        plt.ylabel("ψₙ(x)")
-        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
-        plt.grid(True)
+            # Save TXT 
+            if save_txt:
+                txt_filename = f"{self.root_filename}/{self.root_filename}_psi_level_{n}.txt"
+                header_info = (f"Level: {n}\nEnergy: {eigval:.8e}\n"
+                               f"L_domain: {L:.6f}\nX            Psi(x)")
+                np.savetxt(txt_filename, np.column_stack((x, psi_n)), 
+                           fmt='%.6e', header=header_info)
+                print(f"-> Saved TXT: Level {n}")
+
+        # Aesthetic settings
+        plotted_indices = [i - 1 for i in idx]
+        plt.title(f"Eigenfunctions $\psi_n(x)$ — Levels {plotted_indices}")
+        plt.xlabel("Position $x$ [a.u.]")
+        plt.ylabel("$\psi_n(x)$")
+        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1), fontsize='small')
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
 
-        # Save or display the figure.
         if save:
-            plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        if show:
-            plt.show()
-        else:
+            plt.savefig(img_save_path, dpi=900, bbox_inches="tight")
+            print(f"-> Image saved: {img_save_path}")
+            
+        else: 
             plt.close()
-    
-    def plot_wavefunction_3d(self, level: int, x_points: int = 800, y_points: int = 50, show: bool = True, save: bool = True):
+
+    @safe_execution
+    def plot_eigenfunction_3d(self, level: int, x_points: int = 800, y_points: int = 50, show: bool = True, save: bool = True):
         """
-        Plots the eigenfunction ψₙ(x) as a 3D surface for a single level.
-
-        Axes:
-            - x: position
-            - y: auxiliary axis (only to give “width” to the surface)
-            - z: value of ψₙ(x)
-
+        Plots the eigenfunction $\psi_n(x)$ as a 3D surface (extrusion along the Y axis).
+        Useful for relief-style visualization of the magnitude.
         """
 
-        save_path = f"{self.root_filename}_wavefunction3D_level{level}.png"
+        save_path = f"{self.root_filename}/{self.root_filename}_eigenfunction3D_level{level}.png"
 
-        pair = self.its_eigenpairs(level)
-        eigval, vec = pair
-
-        L = getattr(self, "length", None) or getattr(self, "L_optimal", None)
-        if L is None:
-            raise AttributeError("Define self.length before plotting.")
+        # Datas
+        eigval, vec = self.its_eigenpairs(level)
+        L = getattr(self, "length", None)
         x = np.linspace(0.0, L, x_points)
-
         psi_n = self.an_eigenfunction(x, vec).real
 
-        # Create a 2D mesh: the Y-axis is only auxiliary.
+        # Create the mesh grid
         y = np.linspace(0, 1, y_points)
         X, Y = np.meshgrid(x, y)
-        Z = np.tile(psi_n, (y_points, 1))  # Repeats ψ(x) along the Y-axis.
+        
+        # Replicate the wavefunction along the Y axis (dummy axis)
+        Z = np.tile(psi_n, (y_points, 1))
 
-        # Plot the surface.
+        # Plot 3D
         fig = plt.figure(figsize=(10, 6))
         ax = fig.add_subplot(111, projection='3d')
         surf = ax.plot_surface(X, Y, Z, cmap="viridis", edgecolor="none")
 
         n = level - 1
-        ax.set_title(f"Eigenfunction ψₙ(x) — Level {n}")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_zlabel("ψₙ(x)")
+        ax.set_title(f"Eigenfunction $\psi_{{{n}}}(x)$ — Level {n}")
+        ax.set_xlabel("$x$")
+        ax.set_ylabel("$y$ (aux)")
+        ax.set_zlabel("$\psi_n(x)$")
         fig.colorbar(surf, shrink=0.5, aspect=5)
 
         if save:
-            plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        if show:
-            plt.show()
-        else:
-            plt.close()
-    
-    def probability_density_is_plotted(self, t, coefficients, num_frames=None, num_slices=None,
-                                   save=False, **plotopts):
-        """
-        Plot the probability density |ψ(x,t)|² as a function of position.
+            plt.savefig(save_path, dpi=900, bbox_inches="tight")
         
-        Possible Calls
-            - p.probability_density_is_plotted(t, coefficients)
-                t is a single time instant (numeric): generates a static plot.
+        if show: plt.show()
+        else: plt.close()
 
-            - p.probability_density_is_plotted((t1, t2), coefficients)
-                t is a time interval: generates an animation using num_frames (default: 10).
-
-            - p.probability_density_is_plotted((t1, t2), coefficients, num_frames)
-                Generates an animation with the specified number of frames.
-
-        Parameters
-            t : float or tuple/list of float
-                Single instant (numeric) or interval [t1, t2] representing the time range.
-            coefficients : list of complex
-                List of N complex coefficients (normalization is automatic).
-            num_frames : int, optional
-                Number of frames for the animation (default: 100).
-            num_slices : int, optional
-                Number of points along the x-axis (default: 200).
-            save : bool, optional
-                If True, saves the animation as a GIF or PNG.
-            **plotopts : dict, optional
-                Additional plotting options such as "color", "title", "xlabel", "ylabel", "figsize".
+    @safe_execution
+    def probability_density_is_plotted(self, t, coefficients, num_frames=None, num_slices=None, save=False, **plotopts):
+        """
+        Plots the probability density $|\Psi(x,t)|^2$.
+        Supports static mode (t = float) or animation mode (t = tuple).
         """
 
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as animation
-
-        # Validates the number of coefficients.
         if len(coefficients) != self.num_levels:
-            raise ValueError(f"Expected {self.num_levels} coefficients, got {len(coefficients)}.")
+            raise ValueError(f"Expected {self.num_levels} coefficients.")
 
-        # Animated case (time interval).
+        num_slices = num_slices or 200
+        x_values = np.linspace(0, self.length, num_slices)
+
+        # --- ANIMATION MODE (Time Interval) ---
         if isinstance(t, (tuple, list)) and len(t) == 2:
-            if num_frames is None:
-                num_frames = 100
+            num_frames = num_frames or 100
             t1, t2 = t
             times = np.linspace(t1, t2, num_frames)
-            if num_slices is None:
-                num_slices = 200
-            x_values = np.linspace(0, self.length, num_slices)
 
             fig, ax = plt.subplots(figsize=plotopts.get("figsize", (8, 6)))
 
-            # Precomputes all frames.
-            y_all_frames = [self.probability_density(x_values, t_frame, coefficients) for t_frame in times]
-            global_min = np.min([np.min(y) for y in y_all_frames])
-            global_max = np.max([np.max(y) for y in y_all_frames])
-            ax.set_ylim(global_min, global_max)
+            # Compute the entire matrix (num_frames × num_slices) at once or in a fast loop
+            print("Computing density frames…")
+            y_all_frames = []
+            for t_frame in times:
+                dens = self.probability_density(x_values, t_frame, coefficients)
+                y_all_frames.append(dens)
+            
+            y_all_frames = np.array(y_all_frames) 
+            
+            # Physical consistency: define fixed limits based on the global maximum
+            global_max = np.max(y_all_frames)
+            ax.set_ylim(0, global_max * 1.1) # Margin 10%
 
             line, = ax.plot(x_values, y_all_frames[0], color=plotopts.get("color", "blue"))
-            ax.set_xlabel(plotopts.get("xlabel", "Position (x)"))
-            ax.set_ylabel(plotopts.get("ylabel", "|ψ(x,t)|²"))
+            ax.set_xlabel(plotopts.get("xlabel", "Position $x$"))
+            ax.set_ylabel(plotopts.get("ylabel", "$|\Psi(x,t)|^2$"))
+            
+            title_text = ax.text(0.5, 1.05, "", transform=ax.transAxes, ha="center")
 
             def update(i):
                 line.set_ydata(y_all_frames[i])
-                ax.set_title(f"Probability Density |ψ(x,t)|² (t={times[i]:.2f})")
-                return line,
+                title_text.set_text(f"Probability Density ($t={times[i]:.2f}$)")
+                return line, title_text
 
-            ani = animation.FuncAnimation(fig, update, frames=len(times), interval=200, blit=True)
+            ani = animation.FuncAnimation(fig, update, frames=len(times), interval=100, blit=True)
 
             if save:
-                filename = f"{self.root_filename}_prob_density.gif"
-                ani.save(filename, writer="pillow", fps=5)
+                filename = f"{self.root_filename}/{self.root_filename}_prob_density.gif"
+                ani.save(filename, writer="pillow", fps=15)
                 plt.close(fig)
-                print(f"Animation saved at: '{filename}'")
+                print(f"-> Animation saved: {filename}")
             else:
                 plt.show()
 
-        # Static case (single time)
+        # --- STATIC MODE (Single Time) ---
         else:
-            if num_slices is None:
-                num_slices = 500
-            x_values = np.linspace(0, self.length, num_slices)
             density_values = self.probability_density(x_values, t, coefficients)
 
             plt.figure(figsize=plotopts.get("figsize", (8, 6)))
             plt.plot(x_values, density_values, color=plotopts.get("color", "blue"))
-            plt.xlabel(plotopts.get("xlabel", "Position (x)"))
-            plt.ylabel(plotopts.get("ylabel", "|ψ(x,t)|²"))
-            plt.title(plotopts.get("title", f"Probability Density |ψ(x,t)|² (t={t})"))
+            plt.xlabel(plotopts.get("xlabel", "Position $x$"))
+            plt.ylabel(plotopts.get("ylabel", "$|\Psi(x,t)|^2$"))
+            plt.title(plotopts.get("title", f"Probability Density ($t={t}$))"))
             plt.grid(True)
+            plt.ylim(bottom=0) # Density is never negative
 
             if save:
-                filename = f"{self.root_filename}_prob_density_t{t}.png"
-                plt.savefig(filename, dpi=150)
+                filename = f"{self.root_filename}/{self.root_filename}_prob_density_t{t}.png"
+                plt.savefig(filename, dpi=900)
                 plt.close()
-                print(f"Static plot saved at: '{filename}'")
+                print(f"-> Static plot saved: {filename}")
             else:
                 plt.show()
-     
-    def probability_density_3d(self, t_interval, coefficients, num_frames=50, num_slices=200,
-                            animate_rotation=False, save_as_gif=True, gif_filename=None, **plotopts):
+
+    @safe_execution
+    def probability_density_3d(self, t_interval, coefficients, num_frames=50, num_slices=200, animate_rotation=False, save_as_gif=True, gif_filename=None, **plotopts):
         """
-        Plot the probability density |ψ(x,t)|² in a 3D graph.
-
-        Axes:
-            - x-axis: Position (0 -> self.length)
-            - y-axis: Time (t1 -> t2)
-            - z-axis: Probability density
-
-        Parameters
-        ----------
-        t_interval : tuple(float, float)
-            Intervalo de tempo (t1, t2).
-        coefficients : list[complex]
-            Coeficientes da função de onda.
-        num_frames : int
-            Número de pontos no tempo.
-        num_slices : int
-            Número de pontos no espaço.
-        animate_rotation : bool
-            Se True, anima a rotação 3D.
-        save_as_gif : bool
-            Se True, salva a animação como GIF.
-        gif_filename : str
-            Nome do arquivo GIF (default: "<root>_probability_density_3d.gif").
-        **plotopts : dict
-            Opções extras de plotagem (cmap, figsize, labels, etc.).
+        Generates a 3D plot of the time evolution of the probability density.
+        Axes: X (Position), Y (Time), Z (Density).
         """
 
         if gif_filename is None:
-            gif_filename = f"{self.root_filename}_probability_density_3d.gif"
+            gif_filename = f"{self.root_filename}/{self.root_filename}_probability_density_3d.gif"
 
-        # Time interval.
         t1, t2 = t_interval
         t_values = np.linspace(t1, t2, num_frames)
         x_values = np.linspace(0, self.length, num_slices)
 
-        # Mesh (time × position).
+        # Meshgrid (Time x Position)
         T, X = np.meshgrid(t_values, x_values, indexing='ij')
 
-        # Probability density.
+        # Fill the density matrix
+        print("Computing 3D surface...")
         density = np.empty_like(T, dtype=float)
+        
         for i, t_val in enumerate(t_values):
+            # Spatial vectorization for each time step
             density[i, :] = self.probability_density(x_values, t_val, coefficients)
 
-        # 3D figure.
+        # Setup 3D Figure
         figsize = plotopts.get("figsize", (10, 8))
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection='3d')
@@ -1442,206 +1530,539 @@ class SpectralMethod:
         cmap = plotopts.get("cmap", "viridis")
         surf = ax.plot_surface(X, T, density, cmap=cmap, edgecolor='none')
 
-        # Labels
-        ax.set_xlabel(plotopts.get("xlabel", "Position (x)"))
-        ax.set_ylabel(plotopts.get("ylabel", "Time (t)"))
-        ax.set_zlabel(plotopts.get("zlabel", "|ψ(x,t)|²"))
-        ax.set_title(plotopts.get("title", "Probability Density (3D)"))
+        ax.set_xlabel(plotopts.get("xlabel", "Position $x$"))
+        ax.set_ylabel(plotopts.get("ylabel", "Time $t$"))
+        ax.set_zlabel(plotopts.get("zlabel", "$|\Psi(x,t)|^2$"))
+        ax.set_title(plotopts.get("title", "Time Evolution of Probability Density"))
         fig.colorbar(surf, shrink=0.5, aspect=5)
 
-        # Animation
+        # Camera rotation animation
         if animate_rotation or save_as_gif:
-            def update(frame):
+            def update_view(frame):
                 ax.view_init(elev=30, azim=frame)
                 return [surf]
 
-            angle_frames = np.linspace(0, 360, num_frames)
-            ani = animation.FuncAnimation(fig, update, frames=angle_frames, interval=200, blit=False)
+            # Full rotation (360 degrees)
+            angle_frames = np.linspace(0, 360, 60) 
+            ani = animation.FuncAnimation(fig, update_view, frames=angle_frames, interval=100, blit=False)
 
             if save_as_gif:
-                ani.save(gif_filename, writer="pillow", fps=30)
+                ani.save(gif_filename, writer="pillow", fps=15)
                 plt.close(fig)
-                print(f"3D GIF saved at: '{gif_filename}'")
+                print(f"-> 3D GIF saved: {gif_filename}")
             else:
                 plt.show()
         else:
             plt.show()
 
         return fig, ax, density, t_values, x_values
-    
-    def plot_wavefunction_and_density(self, t, coefficients, num_frames=None, num_slices=None, 
-                                    save_as_gif=False, gif_filename="wavefunction_density.gif", **plotopts):
-        """
-        Plots |ψ(x,t)| (modulus) and |ψ(x,t)|² (probability density) as static or animated plots.
 
-        Parameters:
-            - t: Time instant (float) or interval (tuple [t1, t2]) for animation.
-            - coefficients: List of coefficients for the wave function.
-            - num_frames (optional): Number of frames for animation.
-            - num_slices (optional): Number of x-points (default 200).
-            - save_as_gif (bool): Save animation or static frame as GIF.
-            - gif_filename (str): Filename to save.
-            - **plotopts: Additional plot options like title, xlabel, etc.
+    @safe_execution
+    def plot_wavefunction_and_density(self, t, coefficients, num_frames=None, num_slices=None, save_as_gif=False, gif_filename=None, **plotopts):
         """
-        if num_slices is None:
-            num_slices = 200
+        Plots, side by side:
+        1. The wavefunction magnitude $|\Psi(x,t)|$
+        2. The probability density $|\Psi(x,t)|^2$
+        """
+
+        if gif_filename is None:
+            gif_filename = f"{self.root_filename}/{self.root_filename}_wavefunction_density.gif"
+
+        num_slices = num_slices or 200
         x_values = np.linspace(0, self.length, num_slices)
 
+        # Helper: assumes wave_function is vectorized in x
         def get_data(t_val):
-            psi = np.array([self.wave_function(x, t_val, coefficients) for x in x_values])
+            psi = self.wave_function(x_values, t_val, coefficients)
             return np.abs(psi), np.abs(psi)**2
 
+        # --- ANIMATION ---
         if isinstance(t, (tuple, list)) and len(t) == 2:
-            # Animation mode
-            if num_frames is None:
-                num_frames = 100
+            num_frames = num_frames or 200
             times = np.linspace(t[0], t[1], num_frames)
+            
+            # Precompute for smoother results
+            print("Computing comparative frames…")
             mod_all = []
             dens_all = []
             for t_val in times:
-                mod, dens = get_data(t_val)
-                mod_all.append(mod)
-                dens_all.append(dens)
+                m, d = get_data(t_val)
+                mod_all.append(m)
+                dens_all.append(d)
+            
+            mod_all = np.array(mod_all)
+            dens_all = np.array(dens_all)
+            
+            # Fixed global limits
+            max_mod = np.max(mod_all)
+            max_dens = np.max(dens_all)
 
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=plotopts.get("figsize", (12, 5)))
-            line1, = ax1.plot(x_values, mod_all[0], label="|ψ(x,t)|")
-            line2, = ax2.plot(x_values, dens_all[0], label="|ψ(x,t)|²", color="orange")
-            ax1.set_title("Wavefunction Modulus |ψ(x,t)|")
-            ax2.set_title("Probability Density |ψ(x,t)|²")
+            
+            line1, = ax1.plot(x_values, mod_all[0], label="$|\Psi|$")
+            line2, = ax2.plot(x_values, dens_all[0], label="$|\Psi|^2$", color="orange")
+            
+            ax1.set_ylim(0, max_mod * 1.1)
+            ax2.set_ylim(0, max_dens * 1.1)
+            
+            ax1.set_title("Wavefunction Modulus $|\Psi|$")
+            ax2.set_title("Probability Density $|\Psi|^2$")
+            
             for ax in (ax1, ax2):
-                ax.set_xlabel("x")
+                ax.set_xlabel("$x$")
                 ax.grid(True)
-            ax1.set_ylim(0, 1.1 * np.max(mod_all))
-            ax2.set_ylim(0, 1.1 * np.max(dens_all))
+            
+            suptitle = fig.suptitle(f"t = {times[0]:.2f}")
 
             def update(i):
                 line1.set_ydata(mod_all[i])
                 line2.set_ydata(dens_all[i])
-                fig.suptitle(f"t = {times[i]:.2f}")
-                return line1, line2
+                suptitle.set_text(f"t = {times[i]:.2f}")
+                return line1, line2, suptitle
 
             ani = animation.FuncAnimation(fig, update, frames=len(times), interval=500, blit=True)
 
             if save_as_gif:
-                ani.save(gif_filename, writer="pillow", fps=5)
+                ani.save(gif_filename, writer="pillow", fps=30)
                 plt.close(fig)
-                print(f"GIF saved as: {gif_filename}")
+                print(f"-> GIF saved: {gif_filename}")
             else:
                 plt.show()
 
+        # --- STATIC ---
         else:
-            # Static mode
             mod_vals, dens_vals = get_data(t)
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=plotopts.get("figsize", (12, 5)))
-            ax1.plot(x_values, mod_vals, label="|ψ(x,t)|")
-            ax2.plot(x_values, dens_vals, label="|ψ(x,t)|²", color="orange")
-            ax1.set_title("Wavefunction Modulus |ψ(x,t)|")
-            ax2.set_title("Probability Density |ψ(x,t)|²")
+            
+            ax1.plot(x_values, mod_vals, label="$|\Psi|$")
+            ax2.plot(x_values, dens_vals, label="$|\Psi|^2$", color="orange")
+            
+            ax1.set_title(f"Modulus $|\Psi|$ ($t={t:.2f}$)")
+            ax2.set_title(f"Density $|\Psi|^2$ ($t={t:.2f}$)")
+            
             for ax in (ax1, ax2):
-                ax.set_xlabel("x")
+                ax.set_xlabel("$x$")
                 ax.grid(True)
-            fig.suptitle(f"t = {t:.2f}")
-
-            if save_as_gif:
-                plt.savefig(gif_filename, dpi=150)
-                plt.close()
-                print(f"Image saved as: {gif_filename}")
+                ax.set_ylim(bottom=0)
+            
+            if save_as_gif: 
+                # Save as PNG in static mode, even if save_as_gif is True
+                png_name = gif_filename.replace(".gif", ".png")
+                plt.savefig(png_name, dpi=900)
+                plt.close(fig)
+                print(f"-> Image saved: {png_name}")
             else:
                 plt.show()
 
-    def probability_density_cartoon(self,  t, coefficients, num_slices=None, save_as_gif=True, gif_fps=30, cmap='plama',                                  **plotopts):
+    @safe_execution
+    def probability_density_cartoon(self, t, coefficients, num_slices=None, num_frames=None, save_as_gif=True, gif_filename=None, gif_fps=90, cmap='plasma', **plotopts):
         """
-            Display or save as GIF a "cartoon" of the probability density.
+        Displays or saves a "cartoon" (2D heatmap) of the probability density.
+        Useful for visualizing particle localization as a "film strip."
 
-            - If t is a float → generates a static plot at time t.
-            - If t is a tuple (t0, t1) → generates an animation from t0 to t1.
-
-            Parameters
-            ----------
-            num_slices : int, optional
-                Number of x samples to use (default: 500).
-            save_as_gif : bool, optional
-                If True, saves the animation to `gif_filename`.
-            gif_filename : str, optional
-                Name of the output GIF file.
-            gif_fps : int, optional
-                Frames per second of the GIF.
-            **plotopts : dict, optional
-                Additional options passed to plt.imshow (e.g., cmap="viridis").
+        Parameters
+        ----------
+        t : float or tuple
+            - If float: generates a static plot.
+            - If tuple (t0, t1): generates an animation.
+        coefficients : list
+            Wavefunction coefficients.
+        num_slices : int, optional
+            Spatial resolution (number of points along the x-axis). Default: 500.
+        num_frames : int, optional
+            Temporal resolution (animation only). Default: 100.
+        save_as_gif : bool
+            If True, saves the output to a file.
+        gif_filename : str
+            Output filename.
+        **plotopts : dict
+            Additional arguments passed to `plt.imshow`.
         """
-       
-        gif_filename = f"{self.root_filename}_density_cartoon.gif"
         
-        resolution = 500
+        if gif_filename is None:
+            gif_filename = f"{self.root_filename}/{self.root_filename}_density_cartoon.gif"
+            
+        resolution = num_slices or 500
         x = np.linspace(0, self.length, resolution)
-
+        
+        # Auxiliary function to generate the 2D matrix (vertical extrusion)
         def make_image(t_val):
-            # Use negative density values to emphasize regions of higher probability.
-            dens = -self.probability_density(x, t_val, coefficients)
-            # Construct a 2D image by replicating the density values along the vertical axis.
+            # Density is positive. The colormap handles the visual intensity.
+            dens = self.probability_density(x, t_val, coefficients)
+            # Repeat the row 50 times to create a visible "band"
             return np.tile(dens, (50, 1))
 
-        # extent and style parameters
+        # Extent to map pixels to real coordinates (x: 0->L, y: 0->1)
         extent = [0, self.length, 0, 1]
-        im_kwargs = dict(extent=extent, aspect="auto", cmap=cmap,  **plotopts)
-
+        
+        # STATIC
         if isinstance(t, (int, float)):
-            # STATIC PLOT
-            fig, ax = plt.subplots()
-            img = make_image(t)
-            im = ax.imshow(img, **im_kwargs)
-            ax.set_xlabel("x")
-            ax.set_yticks([])
-            ax.set_title(f"Probability Density at t={t:.3f}")
-            fig.colorbar(im, ax=ax)
+            # Compute data
+            img_data = make_image(t)
+            
+            fig, ax = plt.subplots(figsize=plotopts.get("figsize", (8, 6)))
+            
+            # vmin=0 ensures zero corresponds to the background/cold color
+            im = ax.imshow(img_data, extent=extent, aspect="auto", cmap=cmap, 
+                           vmin=0, **plotopts)
+                           
+            ax.set_xlabel("Position $x$")
+            ax.set_yticks([]) # Remove Y axis since it is artificial
+            ax.set_title(f"Density Cartoon ($t={t:.3f}$)")
+            fig.colorbar(im, ax=ax, label="$|\Psi|^2$")
+            
             if save_as_gif:
-                # save single frame as GIF
-                fig.savefig(gif_filename, format="gif")
+                # Save as PNG in static mode
+                static_name = gif_filename.replace(".gif", ".png")
+                fig.savefig(static_name, dpi=900, bbox_inches='tight')
                 plt.close(fig)
-                print(f"Saved static density as GIF in file: {gif_filename}")
+                print(f"-> Static cartoon saved: {static_name}")
             else:
                 plt.show()
 
+        # ANIMATION
         elif isinstance(t, (tuple, list)) and len(t) == 2:
-            # ANIMATION
             t0, t1 = t
-            if num_slices is None or num_slices <= 0:
-                num_slices = 10
-            times = np.linspace(t0, t1, num_slices)
+            frames_count = num_frames or 100
+            times = np.linspace(t0, t1, frames_count)
 
-            fig, ax = plt.subplots()
+            # A. Precomputation for global normalization
+            print("Calculando máximo global para escala de cores...")
+            max_density_global = 0.0
+            # Quick sampling to find the maximum (check t0, midpoint, and t1)
+            check_times = np.linspace(t0, t1, min(10, frames_count))
+            for check_t in check_times:
+                d_check = self.probability_density(x, check_t, coefficients)
+                current_max = np.max(d_check)
+                if current_max > max_density_global:
+                    max_density_global = current_max
+            
+            # Add a safety margin
+            vmax = max_density_global * 1.05
+
+            # B. Plot setup
+            fig, ax = plt.subplots(figsize=plotopts.get("figsize", (8, 6)))
+            
+            # Initial frame
             img0 = make_image(times[0])
-            im = ax.imshow(img0, **im_kwargs)
-            ax.set_xlabel("x")
+            im = ax.imshow(img0, extent=extent, aspect="auto", cmap=cmap,
+                           vmin=0, vmax=vmax, **plotopts)
+            
+            ax.set_xlabel("Position $x$")
             ax.set_yticks([])
-            fig.colorbar(im, ax=ax)
+            title = ax.set_title(f"Density Cartoon ($t={times[0]:.3f}$)")
+            # Fixed colorbar
+            fig.colorbar(im, ax=ax, label="$|\Psi|^2$")
 
-            def update(frame_t):
-                im.set_data(make_image(frame_t))
-                ax.set_title(f"t = {frame_t:.3f}")
-                return (im,)
+            def update(frame_idx):
+                t_curr = times[frame_idx]
+                im.set_data(make_image(t_curr))
+                title.set_text(f"Density Cartoon ($t={t_curr:.3f}$)")
+                return (im, title)
 
-            ani = FuncAnimation(
-                fig,
-                update,
-                frames=times,
-                interval=500,
-                blit=True,
-                repeat=True
+            ani = animation.FuncAnimation(
+                fig, update, frames=len(times), 
+                interval=1000/gif_fps, blit=True
             )
 
             if save_as_gif:
                 ani.save(gif_filename, writer="pillow", fps=gif_fps)
                 plt.close(fig)
-                print(f"Animation saved as GIF in file: {gif_filename}")
+                print(f"-> Cartoon GIF saved: {gif_filename}")
             else:
                 plt.show()
 
         else:
-            raise ValueError("t must be a number or a tuple/list [t0, t1].")
+            raise ValueError("t must be a number or a tuple/list [t0, t1].")  
         
-    # --- Methods for Calculate Position ---
+    @safe_execution
+    def plot_wavefunction_snapshot(self, t: float, coefficients, num_slices: int = 1000, 
+                                    save_data: bool = False, data_filename: str = None,
+                                    plot_filename: str = None,
+                                    **plotopts):
+            """
+            Plots the wavefunction at a fixed time t.
+            Allows saving both the figure and the data (.txt).
+            """
+            import datetime 
+
+            # Data preparation
+            x_values = np.linspace(0, self.length, num_slices)
+            psi_values = self.wave_function(x_values, t, coefficients)
+            
+            mod_psi = np.abs(psi_values)
+            prob_density = mod_psi**2
+            real_part = np.real(psi_values)
+
+            # Plotting
+            fig, ax = plt.subplots(figsize=plotopts.get("figsize", (10, 6)))
+            
+            # Magnitude (Solid black line)
+            ax.plot(x_values, mod_psi, 'k-', linewidth=2, label=r'$|\Psi(x,t)|$')
+
+            ax.set_title(f"Wavefunction Snapshot at t = {t:.4f}")
+            ax.set_xlabel("Position x")
+            ax.set_xlim(0, self.length)
+            ax.legend(loc='upper right')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            
+            plt.tight_layout()
+
+            # Save IMAGE 
+            if save_data:
+                if plot_filename is None:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    plot_filename = f"{self.root_filename}/{self.root_filename}_plot_t{t:.2f}_{timestamp}.png"
+                
+                fig.savefig(plot_filename, dpi=900, bbox_inches='tight')
+                print(f"Plot image saved: {plot_filename}")
+
+            # Display on screen
+            plt.show()
+
+            # Save txt data
+            if save_data:
+                if data_filename is None:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    data_filename = f"{self.root_filename}/{self.root_filename}_data_t{t:.2f}_{timestamp}.txt"
+                
+                print(f"Exporting wavefunction data to: {data_filename} ...")
+                try:
+                    with open(data_filename, "w", encoding='utf-8') as f:
+                        f.write(f"# Wavefunction Data for t={t}, L={self.length}\n")
+                        f.write(f"# Column 1: x (Position)\n")
+                        f.write(f"# Column 2: Psi (Complex)\n")
+                        f.write(f"# Column 3: |Psi|^2 (Density)\n")
+                        f.write(f"# -----------------------------------\n")
+                        for x, psi, dens in zip(x_values, psi_values, prob_density):
+                            f.write(f"{x:.8e}\t{psi:.8e}\t{dens:.8e}\n")
+                    print("-> Data export successful.")
+                except Exception as e:
+                    print(f"Error exporting data: {e}")
+
+    @safe_execution
+    def plot_wavefunction_3d(self, t_span: tuple, coefficients, num_x: int = 100, num_t: int = 100, save_data: bool = False, data_filename: str = None,
+                                plot_filename: str = None, elev=30, azim=-45, **plotopts):
+            """
+            Plots the TIME EVOLUTION of the wavefunction magnitude in 3D.
+
+            Axes:
+            X: Position
+            Y: Time (t)
+            Z: Magnitude |Psi(x,t)|
+
+            Args:
+                t_span (tuple): Time interval (t_start, t_end).
+                coefficients: Expansion coefficients.
+                num_x (int): Spatial resolution.
+                num_t (int): Temporal resolution.
+            """
+            import datetime
+            from mpl_toolkits.mplot3d import Axes3D
+            from matplotlib import cm
+
+            t_start, t_end = t_span
+            
+            # Grid generation
+            x = np.linspace(0, self.length, num_x)
+            t = np.linspace(t_start, t_end, num_t)
+            X, T = np.meshgrid(x, t)  # Build the coordinate matrix
+            
+            # Compute the Z matrix (|Psi|)
+            Z = np.zeros_like(X)
+            
+            print(f"Computing time evolution from t={t_start} to t={t_end}...")
+            
+            # Time loop (matrix rows)
+            for i, t_val in enumerate(t):
+                psi_vals = self.wave_function(x, t_val, coefficients)
+                Z[i, :] = np.abs(psi_vals)  # Store magnitude values
+                
+            # Plot setup
+            fig = plt.figure(figsize=plotopts.get("figsize", (12, 9)))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            # Clean layout for publication
+            ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.grid(True, linestyle=':', color='gray', alpha=0.3)
+            
+            # Surface rendering
+            surf = ax.plot_surface(X, T, Z, cmap='viridis', edgecolor='none', alpha=0.9, antialiased=True)
+            
+            # Add contour projections on the base plane for better magnitude interpretation
+            ax.contourf(X, T, Z, zdir='z', offset=0, cmap='viridis', alpha=0.3)
+
+            # Axis and label adjustments
+            ax.set_xlabel(r'Position $x$', fontsize=11, labelpad=10)
+            ax.set_ylabel(r'Time $t$', fontsize=11, labelpad=10)
+            ax.set_zlabel(r'$|\Psi(x,t)|$', fontsize=11, labelpad=10)
+            ax.set_title(f"Time Evolution of Wavefunction Modulus\nInterval: [{t_start}, {t_end}]", fontsize=14)
+            
+            ax.set_xlim(0, self.length)
+            ax.set_ylim(t_start, t_end)
+            ax.set_zlim(0, Z.max() * 1.1) # Adjust z-limits to prevent peak clipping
+            
+            ax.view_init(elev=elev, azim=azim)
+            ax.invert_xaxis()
+            
+            # Lateral colorbar
+            cbar = fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, pad=0.1)
+            cbar.set_label(r'$|\Psi|$ Magnitude')
+
+            plt.tight_layout()
+
+            # Save image
+            if save_data:
+                if plot_filename is None:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    plot_filename = f"{self.root_filename}/{self.root_filename}_Evol3D_{timestamp}.png"
+                
+                print(f"Saving Evolution 3D plot to: {plot_filename} ...")
+                plt.savefig(plot_filename, dpi=900, bbox_inches='tight')
+
+            plt.show()
+
+            # Data export (Long Matrix: X, T, Z)
+            if save_data:
+                if data_filename is None:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    data_filename = f"{self.root_filename}/{self.root_filename}_EvolData_{timestamp}.txt"
+                
+                print(f"Exporting Evolution data to: {data_filename} ...")
+                try:
+                    with open(data_filename, "w", encoding='utf-8') as f:
+                        f.write(f"# Wavefunction Evolution Data (Surface)\n")
+                        f.write(f"# T_start={t_start}, T_end={t_end}, Nx={num_x}, Nt={num_t}, L={self.length}\n")
+                        f.write(f"# Column 1: Time (t)\n")
+                        f.write(f"# Column 2: Position (x)\n")
+                        f.write(f"# Column 3: Modulus |Psi(x,t)|\n")
+                        f.write(f"# --------------------------------------------------\n")
+                        
+                        for i in range(num_t):
+                            for j in range(num_x):
+                                # T[i,j], X[i,j], Z[i,j]
+                                f.write(f"{T[i,j]:.6e}\t{X[i,j]:.6e}\t{Z[i,j]:.6e}\n")
+                                
+                    print(" Data export successful.")
+                except Exception as e:
+                    print(f"Error exporting data: {e}")
     
+    @safe_execution
+    def plot_probability_density_3d_static(self, t_interval: tuple, coefficients, num_t: int = 100, num_x: int = 200,  save_data: bool = False, data_filename: str = None, plot_filename: str = None, elev=30, azim=135,                                        **plotopts):
+        """
+        Generates a STATIC 3D figure of the time evolution of the probability density.
+
+        Args:
+            t_interval: (t_start, t_end)
+            coefficients: Expansion coefficients.
+            num_t: Temporal resolution.
+            num_x: Spatial resolution.
+        """
+
+        import datetime
+        from mpl_toolkits.mplot3d import Axes3D
+        from matplotlib import cm
+
+        t1, t2 = t_interval
+        
+        # Grid generation
+        x_values = np.linspace(0, self.length, num_x)
+        t_values = np.linspace(t1, t2, num_t)
+        
+        X, T = np.meshgrid(x_values, t_values)
+        Z = np.zeros_like(X) # Density matrix construction
+        
+        print(f"Computing density surface ({num_t}x{num_x})...")
+        
+        # Fill the matrix
+        for i, t_val in enumerate(t_values):
+            # Compute |Psi|^2 over the full spatial domain at time t
+            dens_vals = self.probability_density(x_values, t_val, coefficients)
+            Z[i, :] = dens_vals
+
+        # Figure setup
+        figsize = plotopts.get("figsize", (12, 9))
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Remove pane background colors
+        ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.grid(True, linestyle=':', color='gray', alpha=0.3)
+
+        # Surface rendering
+        cmap = plotopts.get("cmap", "viridis") 
+        surf = ax.plot_surface(X, T, Z, cmap=cmap, edgecolor='none', alpha=0.9, antialiased=True)
+        
+        # Add contour projection onto the base plane (z=0) for better interpretation
+        ax.contourf(X, T, Z, zdir='z', offset=0, cmap=cmap, alpha=0.3)
+
+        # Axis and label configuration
+        ax.set_xlabel(plotopts.get("xlabel", "Position $x$"), labelpad=10)
+        ax.set_ylabel(plotopts.get("ylabel", "Time $t$"), labelpad=10)
+        ax.set_zlabel(plotopts.get("zlabel", r"Density $|\Psi(x,t)|^2$"), labelpad=10)
+        ax.set_title(plotopts.get("title", f"Density Evolution t=[{t1}, {t2}]"), fontsize=14)
+        
+        ax.set_xlim(0, self.length)
+        ax.set_ylim(t1, t2)
+        ax.set_zlim(0, Z.max() * 1.1)
+
+        # X-axis inversion
+        ax.invert_yaxis()
+
+        # Camera/view adjustment
+        ax.view_init(elev=elev, azim=azim)
+
+        # Colorbar
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, pad=0.1)
+        cbar.set_label(r'Probability Density')
+
+        plt.tight_layout()
+
+        # Save Image
+        if save_data:
+            if plot_filename is None:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                plot_filename = f"{self.root_filename}/{self.root_filename}_Dens3D_Static_{timestamp}.png"
+            
+            print(f"Saving 3D Density plot to: {plot_filename} ...")
+            plt.savefig(plot_filename, dpi=900, bbox_inches='tight')
+
+        plt.show()
+
+        # Export Data
+        if save_data:
+            if data_filename is None:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                data_filename = f"{self.root_filename}/{self.root_filename}_Dens3D_Data_{timestamp}.txt"
+            
+            print(f"Exporting Density data to: {data_filename} ...")
+            try:
+                with open(data_filename, "w", encoding='utf-8') as f:
+                    f.write(f"# 3D Probability Density Data\n")
+                    f.write(f"# T_start={t1}, T_end={t2}, Nx={num_x}, Nt={num_t}, L={self.length}\n")
+                    f.write(f"# Column 1: Time (t)\n")
+                    f.write(f"# Column 2: Position (x)\n")
+                    f.write(f"# Column 3: Density |Psi|^2\n")
+                    f.write(f"# --------------------------------------------------\n")
+                    
+                    # mesh iteration
+                    for i in range(num_t):
+                        for j in range(num_x):
+                            # T[i,j] -> time, X[i,j] -> position, Z[i,j] -> density
+                            f.write(f"{T[i,j]:.6e}\t{X[i,j]:.6e}\t{Z[i,j]:.6e}\n")
+                            
+                print("Data export successful.")
+            except Exception as e:
+                print(f"Error exporting data: {e}")
+        
+        return fig, ax
+
+    # ----- Methods for Calculate Position -----
+    @safe_execution
     def expected_position(self, coefficients):
         """
             Calculation:  
@@ -1662,7 +2083,7 @@ class SpectralMethod:
                 f"The wave function is a superposition of {self.num_levels} eigenfunctions, but got {len(coefficients)} coefficients."
             )
         
-        n_points = 10000
+        n_points = 5000
         def exp_pos(t):
             # Defines the integrand: x * w(x) * ProbabilityDensity(x, t, coefficients)`
             integrand_num = lambda x: self.probability_density(x, t, coefficients)*x*self.weight(x)
@@ -1680,6 +2101,7 @@ class SpectralMethod:
         
         return exp_pos
     
+    @safe_execution
     def expected_position_squared(self, coefficients):
         """	
             Returns a function that calculates ⟨x²⟩(t):  
@@ -1694,7 +2116,7 @@ class SpectralMethod:
         if len(coefficients) != self.num_levels:
             raise ValueError(f"The wave function is a superposition of {self.num_levels} eigenfunctions, but got {len(coefficients)} coefficients.")
 
-        n_points = 10000
+        n_points = 5000
         def exp_pos_sq(t):
             # Defines the integrand: x^2 * w(x) * ProbabilityDensity(x, t, coefficients)`
             integrand_num = lambda x: self.probability_density(x, t, coefficients)*(x**2)*self.weight(x)
@@ -1708,6 +2130,7 @@ class SpectralMethod:
         
         return exp_pos_sq
 
+    @safe_execution
     def position_uncertainty(self, coefficients):
         """
             Returns a function that calculates the position uncertainty, defined as:  
@@ -1735,6 +2158,7 @@ class SpectralMethod:
 
         return uncertainty
     
+    @safe_execution
     def position_uncertainty_relative(self, coefficients, t_max=None, num_points=300, save_filename=None):
         """
         Computes the relative position uncertainty r_x(t) = sigma_x(t) / <x>(t)
@@ -1779,7 +2203,7 @@ class SpectralMethod:
 
         # Determine output filename if not provided
         if save_filename is None:
-            save_filename = f"{self.root_filename}_min_relative_uncertainty.txt"
+            save_filename = f"{self.root_filename}/{self.root_filename}_min_relative_uncertainty.txt"
 
         # Retrieve helper functions for ⟨x⟩(t) and σₓ(t)
         exp_pos_fn = self.expected_position(coefficients)
@@ -1815,7 +2239,7 @@ class SpectralMethod:
         for t in min_times:
             print(f"t = {t:.15f}")
 
-        # Save results to file (now includes all sampled points)
+        # Save results to file 
         with open(save_filename, 'w', encoding='utf-8') as f:
             f.write(f"# {save_filename}\n")
             f.write(f"# Program version : {self.version}\n")
@@ -1844,11 +2268,12 @@ class SpectralMethod:
         plt.tight_layout()
 
         # Save the plot
-        fig.savefig(f"{self.root_filename}_RelativePositionUncertainty.png", bbox_inches='tight')
+        fig.savefig(f"{self.root_filename}/{self.root_filename}_RelativePositionUncertainty.png", bbox_inches='tight', dpi=2000)
         plt.show()
 
         return fig, min_val, min_times
    
+    @safe_execution
     def expected_position_is_calculated(self, t_range, coefficients, num_points=None):
         """
             Receives a time interval (t_range as (t0, t1)) and a list of coefficients, and generates a file with two columns:  
@@ -1876,7 +2301,7 @@ class SpectralMethod:
         t_points = [t0 + k * dt for k in range(nt + 1)]
         ff = self.expected_position(coefficients)  # f(t) = ⟨x⟩(t)
         # Defines the file name (using the root defined in the root_filename property).
-        filename = f"{self.root_filename}_Position.txt"
+        filename = f"{self.root_filename}/{self.root_filename}_Position.txt"
         
         # Writes the header
         with open(filename, "w", encoding='utf-8') as f:
@@ -1892,55 +2317,57 @@ class SpectralMethod:
                 f.write(f"{float(tt):.6f}\t{float(ff(tt)):.6f}\n")
         print("Data on expected position has been stored in file:", filename)
     
+    @safe_execution
     def expected_position_and_uncertainty_are_calculated(self, t_range, coefficients, num_points=None):
-            """
-                Receives a time interval (t_range as (t0, t1)) and a list of coefficients,  
-                and generates a file with four columns:  
-                (1)Time  
-                (2)Expected position  
-                (3)Expected position – uncertainty  
-                (4)Expected position + uncertainty  
+        """
+            Receives a time interval (t_range as (t0, t1)) and a list of coefficients,  
+            and generates a file with four columns:  
+            (1)Time  
+            (2)Expected position  
+            (3)Expected position – uncertainty  
+            (4)Expected position + uncertainty  
 
-                Behavior:  
-                - If the parameter num_points is provided (must be a positive integer), it sets the number of intermediate points.  
-                - Otherwise, 300 points will be used by default.  
-            """
-            if len(coefficients) != self.num_levels:
-                raise ValueError(f"Expected {self.num_levels} coefficients, but got {len(coefficients)}.")
-            if num_points is not None:
-                if isinstance(num_points, int) and num_points > 0:
-                    nt = num_points
-                else:
-                    raise ValueError(f"Third argument must be a positive integer, got {num_points}.")
+            Behavior:  
+            - If the parameter num_points is provided (must be a positive integer), it sets the number of intermediate points.  
+            - Otherwise, 300 points will be used by default.  
+        """
+        if len(coefficients) != self.num_levels:
+            raise ValueError(f"Expected {self.num_levels} coefficients, but got {len(coefficients)}.")
+        if num_points is not None:
+            if isinstance(num_points, int) and num_points > 0:
+                nt = num_points
             else:
-                print("Calculating 300 points by default.")
-                nt = 300
-            t0, t1 = t_range
-            dt = (t1 - t0) / nt
-            t_points = [t0 + k * dt for k in range(nt + 1)]
-            ff = self.expected_position(coefficients)  # f(t) = ⟨x⟩(t)
-            gg = self.position_uncertainty(coefficients)  # g(t) = σₓ(t)
-            # Auxiliary function to ensure the value is real: if not, returns 0.
-            def ifnotreal(func, t_val):
-                value = func(t_val)
-                if np.isreal(value):
-                    return value
-                else:
-                    return 0.0
-            filename = f"{self.root_filename}_PositionUncertainty.txt"
-            with open(filename, "w", encoding='utf-8') as f:
-                f.write(f"# Filename :          {filename}\n")
-                f.write(f"# Program version :   {self.version}\n")
-                f.write(f"# Start:              {datetime.datetime.now().strftime('%c')}\n")
-                f.write("# (1) time,\t(2) expected position,\t(3) expected position - uncertainty,\t(4) expected position + uncertainty\n")
-                f.write("# " + "="*80 + "\n")
-            with open(filename, "a", encoding='utf-8') as f:
-                for tt in t_points:
-                    ex_pos = ff(tt)
-                    uncert = ifnotreal(gg, tt)
-                    f.write(f"{tt:.6f}\t{ex_pos:.6f}\t{(ex_pos - uncert):.6f}\t{(ex_pos + uncert):.6f}\n")
-            print("Expected position and uncertainty data stored in file:", filename)
-            
+                raise ValueError(f"Third argument must be a positive integer, got {num_points}.")
+        else:
+            print("Calculating 300 points by default.")
+            nt = 300
+        t0, t1 = t_range
+        dt = (t1 - t0) / nt
+        t_points = [t0 + k * dt for k in range(nt + 1)]
+        ff = self.expected_position(coefficients)  # f(t) = ⟨x⟩(t)
+        gg = self.position_uncertainty(coefficients)  # g(t) = σₓ(t)
+        # Auxiliary function to ensure the value is real: if not, returns 0.
+        def ifnotreal(func, t_val):
+            value = func(t_val)
+            if np.isreal(value):
+                return value
+            else:
+                return 0.0
+        filename = f"{self.root_filename}/{self.root_filename}_PositionUncertainty.txt"
+        with open(filename, "w", encoding='utf-8') as f:
+            f.write(f"# Filename :          {filename}\n")
+            f.write(f"# Program version :   {self.version}\n")
+            f.write(f"# Start:              {datetime.datetime.now().strftime('%c')}\n")
+            f.write("# (1) time,\t(2) expected position,\t(3) expected position - uncertainty,\t(4) expected position + uncertainty\n")
+            f.write("# " + "="*80 + "\n")
+        with open(filename, "a", encoding='utf-8') as f:
+            for tt in t_points:
+                ex_pos = ff(tt)
+                uncert = ifnotreal(gg, tt)
+                f.write(f"{tt:.6f}\t{ex_pos:.6f}\t{(ex_pos - uncert):.6f}\t{(ex_pos + uncert):.6f}\n")
+        print("Expected position and uncertainty data stored in file:", filename)
+
+    @safe_execution    
     def expected_position_is_plotted(self):
         """
             Reads a file containing expected position data and returns a plot.
@@ -1952,7 +2379,7 @@ class SpectralMethod:
             - Finally, it plots the curve in black.
         """
         # Defines the initial filename.
-        filename = f"{self.root_filename}_Position.txt"
+        filename = f"{self.root_filename}/{self.root_filename}_Position.txt"
         if not os.path.exists(filename):
             # If it doesn't exist, try the file with uncertainty.
             filename = f"{self.root_filename}_PositionUncertainty"
@@ -1982,9 +2409,10 @@ class SpectralMethod:
         plt.title("Expected Position")
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(f"{self.root_filename}_ExpectedPosition.png", bbox_inches='tight')
+        plt.savefig(f"{self.root_filename}/{self.root_filename}_ExpectedPosition.png", bbox_inches='tight', dpi=2000)
         plt.show()
-
+    
+    @safe_execution
     def expected_position_and_uncertainty_are_plotted(self):
         """
             Reads a file containing expected position and uncertainty data, then returns a plot.
@@ -2001,7 +2429,7 @@ class SpectralMethod:
             - Central curve (expected position) is plotted in black  
 
         """
-        filename = f"{self.root_filename}_PositionUncertainty.txt"
+        filename = f"{self.root_filename}/{self.root_filename}_PositionUncertainty.txt"
         if not os.path.exists(filename):
             raise FileNotFoundError("Data file does not exist.")
         try:
@@ -2032,9 +2460,10 @@ class SpectralMethod:
         plt.grid(True)
         plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
         plt.tight_layout()
-        plt.savefig(f"{self.root_filename}_ExpectedPositionAndUncertainty.png", bbox_inches='tight')
+        plt.savefig(f"{self.root_filename}/{self.root_filename}_ExpectedPositionAndUncertainty.png", bbox_inches='tight', dpi=2000)
         plt.show()
- 
+    
+    @safe_execution
     def analyze_expected_position(self, tolerance=0.05, save=True, show=True):
         """
         Reads the file `<root_filename>_Position.txt` and analyzes patterns in the data:
@@ -2047,7 +2476,7 @@ class SpectralMethod:
 
         """
 
-        filename = f"{self.root_filename}_Position.txt"
+        filename = f"{self.root_filename}/{self.root_filename}_Position.txt"
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File {filename} not found. Run 'expected_position_is_calculated' first.")
 
@@ -2076,7 +2505,7 @@ class SpectralMethod:
         mean_value = np.mean(x)
 
         # --- Save results to a file ---
-        out_file = f"{self.root_filename}_PositionAnalysis.txt"
+        out_file = f"{self.root_filename}/{self.root_filename}_PositionAnalysis.txt"
         with open(out_file, "w", encoding='utf-8') as f:
             f.write(f"# {out_file}\n")
             f.write(f"# Program version :   {self.version}\n")
@@ -2113,7 +2542,7 @@ class SpectralMethod:
         print(f"- Mean value: {mean_value:.4f}")
         print("="*80)
 
-        # --- Gráfico ---
+        # --- Graphic ---
         plt.figure(figsize=(10, 5))
         plt.plot(t, x, 'k-', label="<x>(t)")
         plt.plot(max_times, max_vals, 'ro', label="Maxima")
@@ -2129,14 +2558,14 @@ class SpectralMethod:
         
 
         if save:
-            plt.savefig(f"{self.root_filename}_ExpectedPosition_Analysis.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{self.root_filename}/{self.root_filename}_ExpectedPosition_Analysis.png", dpi=2000, bbox_inches='tight')
         if show:
             plt.show()
         else:
             plt.close()
- 
- # --- Methods for Calculate Momentum ---
- 
+    
+ # ----- Methods for Calculate Momentum -----
+    @safe_execution
     def expected_momentum(self, coefficients):
         """
             Returns a function that numerically calculates the normalized expected momentum ⟨p⟩(t):
@@ -2177,6 +2606,7 @@ class SpectralMethod:
 
         return expected_momentum_numeric
 
+    @safe_execution
     def momentum_uncertainty(self, coefficients):
         """
             Returns a function that numerically calculates the momentum uncertainty Δp(t), normalized:
@@ -2231,6 +2661,7 @@ class SpectralMethod:
 
         return momentum_uncertainty_numeric
 
+    @safe_execution
     def heisenberg_uncertainty(self, coefficients):
         """
             Returns a function that computes the product σₓ(t) * σₚ(t) and compares with ħ/2.
@@ -2262,6 +2693,7 @@ class SpectralMethod:
 
         return uncertainty_product
 
+    @safe_execution
     def momentum_uncertainty_relative(self, coefficients, t_max=None, num_points=200, save_filename=None):
         """
         Computes the relative momentum uncertainty r_p(t) = Δp(t) / ⟨p⟩(t)
@@ -2293,7 +2725,7 @@ class SpectralMethod:
 
         # Determine output filename if not provided
         if save_filename is None:
-            save_filename = f"{self.root_filename}_min_relative_momentum_uncertainty.txt"
+            save_filename = f"{self.root_filename}/{self.root_filename}_min_relative_momentum_uncertainty.txt"
 
         # Retrieve helper functions
         exp_p_fn = self.expected_momentum(coefficients)
@@ -2358,11 +2790,12 @@ class SpectralMethod:
         plt.tight_layout()
 
         # Save the plot
-        fig.savefig(f"{self.root_filename}_RelativeMomentumUncertainty.png", bbox_inches='tight')
+        fig.savefig(f"{self.root_filename}/{self.root_filename}_RelativeMomentumUncertainty.png", bbox_inches='tight')
         plt.show()
 
         return fig, min_val, min_times
 
+    @safe_execution
     def expected_momentum_and_uncertainty_are_calculated(self, t_range, coefficients, num_points=None):
         """
             Receives a time interval (t_range as (t0, t1)) and a list of coefficients,  
@@ -2405,7 +2838,7 @@ class SpectralMethod:
             else:
                 return 0.0
 
-        filename = f"{self.root_filename}_MomentumUncertainty.txt"
+        filename = f"{self.root_filename}/{self.root_filename}_MomentumUncertainty.txt"
         
         # Create and write to the output file.
         with open(filename, "w", encoding='utf-8') as f:
@@ -2423,6 +2856,7 @@ class SpectralMethod:
         
         print("Expected momentum and uncertainty data stored in file:", filename)
 
+    @safe_execution
     def expected_momentum_and_uncertainty_are_plotted(self):
         """
             Reads a file containing expected momentum and uncertainty data, then returns a plot.
@@ -2438,7 +2872,7 @@ class SpectralMethod:
             - Uncertainty regions are shaded in gray  
             - Central curve (expected momentum) is plotted in black  
         """
-        filename = f"{self.root_filename}_MomentumUncertainty.txt"
+        filename = f"{self.root_filename}/{self.root_filename}_MomentumUncertainty.txt"
         if not os.path.exists(filename):
             raise FileNotFoundError(f"The file {filename} does not exist.")
         
@@ -2470,20 +2904,22 @@ class SpectralMethod:
         plt.grid(True)
         plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
         plt.tight_layout()
-        plt.savefig(f"{self.root_filename}_ExpectedMomentumAndUncertainty.png", bbox_inches='tight')
+        plt.savefig(f"{self.root_filename}/{self.root_filename}_ExpectedMomentumAndUncertainty.png", bbox_inches='tight')
         plt.show()
-        
+    
    # --- Methods for Comparing Problems ---
-   
+
+    @safe_execution
     def its_number_of_digits(self):
         '''
-            Retorna o número de dígitos atualmente utilizados pelo objeto.
+        Returns the current number of digits used by the object.
         '''
         return self.digits_used
    
+    @safe_execution
     def is_described(self):
         """
-            # Display the problem description on the screen.
+        Display the problem description on the screen.
         """
         def get_func_repr(func):
             try:
@@ -2526,13 +2962,15 @@ class SpectralMethod:
         print(separator)
         print("Important: when using the spectral method, the potential must be expressed as V_spectral = 2*m*V_real.")
 
-    def is_described_to_file(self, filename):
+    @safe_execution
+    def is_described_to_file(self, filename=None):
         """
             Write the problem description to a file.  
-
             Args:  
             - filename (str): Name of the file where the description will be written.  
         """
+        if filename is None:
+            filename = f"{self.root_filename}/{self.root_filename}_described.txt"
         # Helper function to obtain a user-friendly representation.
         def get_func_repr(func):
             return func.__name__ if hasattr(func, '__name__') else str(func)
@@ -2558,10 +2996,12 @@ class SpectralMethod:
             f.write(separator + "\n")
         print(f"Description has been written to file: {filename}")
     
+    @safe_execution
     def compare_numerically(self, other):
         """
-            Numerically compares the spectra (eigenvalues) of self (caller) and another instance (other).  
-
+        Numerically compares the spectra (eigenvalues) of self (caller) and another instance (other).
+        Generates a detailed TXT report.
+      
             Behavior:  
             - If both problems have their spectra calculated, the generated file will contain:  
             (1) Level  
@@ -2571,71 +3011,75 @@ class SpectralMethod:
             (5) Percentage variation (calculated relative to the caller's eigenvalue)  
 
             - The file will also include a header with program information (version, date, digit count) and problem descriptions.  
-            - If spectra haven't been calculated for both problems, a warning message is displayed.  
+            - If spectra haven't been calculated for both problems, a warning message is displayed.
         """
-        # Checks if both problems have already had their spectra calculated.
+        # Validation
         if not (self.has_spectrum_been_calculated and other.has_spectrum_been_calculated):
             print("Energy spectra have not been calculated for both problems.")
             return
 
-        # Retrieves the spectra (lists of eigenvalues).
-        pSp = self.its_eigenvalues()   # Spectrum of the caller problem.
-        qSp = other.its_eigenvalues()   # Spectrum of the called problem.
-        NumberOfLevels = min(len(pSp), len(qSp))
+        # Retrieve Data
+        pSp = np.array(self.its_eigenvalues())  # Caller
+        qSp = np.array(other.its_eigenvalues())  # Called
         
-        # Retrieves the number of digits (assuming the class stores this information).
-        pDig = self.num_digits
-        qDig = other.num_digits
+        # Limit to the smallest common size
+        n_levels = min(len(pSp), len(qSp))
+        pSp = pSp[:n_levels]
+        qSp = qSp[:n_levels]
+
+        # Vectorized Calculations (Faster than loops)
+        diff_abs = qSp - pSp
         
-        # Defines the output filename.
-        filename = f"{self.root_filename}_Comparison_Eigenvalues.txt"
+        # Safe percentage calculation handling division by zero
+        # usage: where(condition, value_if_true, value_if_false)
+        diff_pct = np.where(
+            np.isclose(pSp, 0, atol=1e-15), 
+            0.0, 
+            (diff_abs / np.abs(pSp)) * 100
+        )
+
+        # Write to File (Single Open Operation)
+        filename = f"{self.root_filename}/{self.root_filename}_Comparison_Eigenvalues.txt"
         separator = "#" + "=" * 80 + "\n"
-        
-        # Opens (or creates) the file and writes the header.
+
+        print(f"Writing comparison to {filename}...")
+
         with open(filename, "w", encoding='utf-8') as f:
+            # Header
             f.write(f"# Filename: {filename}\n")
             f.write("# Comparison of the eigenvalues of two different problems.\n")
             f.write(f"# Program version: {self.version}\n")
             f.write(f"# Start: {datetime.datetime.now().strftime('%c')}\n")
             f.write(separator)
+            
+            # Descriptions (Assuming is_described_to_file appends, we act carefully here. 
             f.write("# Description of the caller problem\n")
-        
-        # Writes the description of the **caller** in the file  
-        # (assuming `is_described_to_file` writes to the file).
-        self.is_described_to_file(filename)
-        
-        # Adds the description of the **called** problem.
-        with open(filename, "a") as f:
-            f.write("# Description of the called problem\n")
-        other.is_described_to_file(filename)
-        
-        # Adds information about the number of eigenvalues and digits used.
-        with open(filename, "a") as f:
-            f.write(f"# Caller problem has {len(pSp)} eigenvalues, calculated with {pDig} Digits\n")
-            f.write(f"# Called problem has {len(qSp)} eigenvalues, calculated with {qDig} Digits\n")
-            f.write(separator)
-            f.write(f"# Absolute and percent variations of the lowest {NumberOfLevels} energy levels:\n")
-            f.write("# Columns: (1) level, (2) caller eigenvalue, (3) called eigenvalue, (4) absolute variation (called - caller), (5) percent variation\n")
-            f.write(separator)
-        
-        # For each level (up to the minimum number of levels between the two problems),  
-        # calculates the absolute variation and percentage variation.
-        for i in range(NumberOfLevels):
-            err1 = qSp[i] - pSp[i]
-            # Avoids division by zero if `pSp[i]` is very close to zero.
-            if math.isclose(pSp[i], 0, abs_tol=1e-15):
-                err2 = 0.0
-            else:
-                err2 = (err1 / abs(pSp[i])) * 100
-            with open(filename, "a") as f:
-                f.write(f"{i+1}\t{pSp[i]:.6f}\t{qSp[i]:.6f}\t{err1:.6f}\t{err2:.6f}\n")
-        
-        print(f"Comparison of spectra has been written in the file {filename}")
-        print("Done")
-    
+            f.close() # Close temporarily if is_described_to_file opens 'a' mode internally
+            
+            self.is_described_to_file(filename)
+            with open(filename, "a", encoding='utf-8') as f: f.write("# Description of the called problem\n")
+            other.is_described_to_file(filename)
+
+            # Re-open for data writing
+            with open(filename, "a", encoding='utf-8') as f:
+                f.write(f"# Caller problem: {len(self.en_spectrum)} eigenvalues ({self.num_digits} Digits)\n")
+                f.write(f"# Called problem: {len(other.en_spectrum)} eigenvalues ({other.num_digits} Digits)\n")
+                f.write(separator)
+                f.write(f"# Data for the lowest {n_levels} energy levels:\n")
+                f.write("# (1) Level\t(2) Caller E\t(3) Called E\t(4) Abs Diff\t(5) % Diff\n")
+                f.write(separator)
+
+                # Batch writing loop
+                for i in range(n_levels):
+                    f.write(f"{i+1}\t{pSp[i]:.6f}\t{qSp[i]:.6f}\t{diff_abs[i]:.6f}\t{diff_pct[i]:.6f}\n")
+
+        print("Done.")
+
+    @safe_execution
     def compare_graphically(self, other):
         """
-            Graphically compares the eigenvalues of the two problems.
+        Graphically compares the eigenvalues of two problems and 
+        analyzes the orthogonality of the caller's eigenvectors.
 
             Prepares two plots:
             (1) Log10 of absolute variations (|qSp - pSp|), with:
@@ -2650,166 +3094,139 @@ class SpectralMethod:
             Args:  
             - other (SpectralMethod): Another instance for comparison.
         """
-        # Checks if both spectra have been calculated.
+        # Validation
         if not (self.has_spectrum_been_calculated and hasattr(self, 'eigenvectors')):
             print("Please solve the eigenvalue and eigenvector problem first.")
             return
-        
-        # Displays the descriptions of the problems.
-        print("Description of the caller problem:")
-        self.is_described()
-        print("\n")
-        print("Description of the called problem:")
-        other.is_described()
-        print("\n")
-        
-        # Retrieves the number of spectra.
-        pSp = self.its_eigenvalues()
-        qSp = other.its_eigenvalues()      
-        
-        NumberOfLevels = min(len(pSp), len(qSp))
-        
-        # Initializes lists for absolute and percentage variations.
-        pontosPos = []         # diffs > 0: Positive variations
-        pontosNeg = []         # diffs < 0: Negative variations
-        pontosNull = []        # diffs == 0: Zero variations
-        pontosPercentPos = []
-        pontosPercentNeg = []
-        pontosPercentNull = []
-        
-        for i in range(NumberOfLevels):
-            diff = qSp[i] - pSp[i]
-            if math.isclose(diff, 0, abs_tol=1e-15):
-                pontosNull.append((i+1, 0))
-                pontosPercentNull.append((i+1, 0))
-            elif diff > 0:
-                pontosPos.append((i+1, math.log10(diff)))
-                percent = (diff / abs(pSp[i])) * 100 if not np.isclose(pSp[i],0, atol=1e-15) else 0
-                pontosPercentPos.append((i+1, percent))
-            else:
-                pontosNeg.append((i+1, math.log10(-diff)))
-                percent = (-diff / abs(pSp[i])) * 100 if not np.isclose(pSp[i],0, atol=1e-15) else 0
-                pontosPercentNeg.append((i+1, percent))
-                
-        # First plot: log10 of absolute variations.
-        print("-" * 80)
-        print("Log10 Absolute Variation.")
-        print("\n")
-        plt.figure(figsize=(10, 5))
-        if pontosPos:
-            pts = np.array(pontosPos)
-            plt.scatter(pts[:, 0], pts[:, 1], color='blue', label="Positive differences (log10)")
-        if pontosNeg:
-            pts = np.array(pontosNeg)
-            plt.scatter(pts[:, 0], pts[:, 1], color='red', label="Negative differences (log10)")
-        if pontosNull:
-            pts = np.array(pontosNull)
-            plt.scatter(pts[:, 0], pts[:, 1], color='green', label="Zero differences")
-            
-        plt.xlabel("Energy level")
-        plt.ylabel("log10(|variation|)")
-        plt.title(f"Log10 of absolute variations (called - caller) for the lowest {NumberOfLevels} energy levels")
-        plt.grid(True)
-        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
-        plt.tight_layout()
-        plt.show()
 
-        # Second plot: percentage variations.
-        print("-" * 80)
-        print("Percent variation.")
-        print("\n")
-        
-        plt.figure(figsize=(10, 5))
-        if pontosPercentPos:
-            pts = np.array(pontosPercentPos)
-            plt.scatter(pts[:, 0], pts[:, 1], color='blue', label="Positive percent variation")
-        if pontosPercentNeg:
-            pts = np.array(pontosPercentNeg)
-            plt.scatter(pts[:, 0], pts[:, 1], color='red', label="Negative percent variation")
-        if pontosPercentNull:
-            pts = np.array(pontosPercentNull)
-            plt.scatter(pts[:, 0], pts[:, 1], color='green', label="Zero variation")
-        plt.xlabel("Energy level")
-        plt.ylabel("Percent variation (%)")
-        plt.title(f"Percent variations [(called - caller)/caller] for the lowest {NumberOfLevels} energy levels")
-        plt.grid(True)
-        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
-        plt.show()
+        # Print Descriptions
+        print("Description of the caller problem:"); self.is_described(); print("\n")
+        print("Description of the called problem:"); other.is_described(); print("\n")
 
-        print("-" * 80)
-        print("Comparing orthogonality of eigenvectors (dot product).")
-        print("\n")
+        # Data Preparation (Vectorized)
+        pSp = np.array(self.its_eigenvalues())
+        qSp = np.array(other.its_eigenvalues())
         
-        # Assuming 'sols' is the list of solutions and 'nsols' is its size.
-        sols = self.its_eigenpairs(save_to_file=False)
-        nsols = len(sols)       
+        n_levels = min(len(pSp), len(qSp))
+        pSp, qSp = pSp[:n_levels], qSp[:n_levels]
         
-       # Creates deviation matrix.
-        ort_matrix = np.zeros((nsols, nsols))
-        for i in range(nsols):
-            for j in range(i+1, nsols):
-                err = abs(self.__scalar_product(sols[i][1], sols[j][1]))
-                ort_matrix[i, j] = err
-
-        # Plot heatmap
-        plt.figure(figsize=(10, 5))
-        im = plt.imshow(np.log10(ort_matrix + 1e-30), cmap="viridis", origin="lower", aspect="auto")
-
-        plt.colorbar(im, label="log10(|<vi,vj>|)")
-        plt.xlabel("Level i")
-        plt.ylabel("Level j")
-        plt.title("Orthogonality deviation between eigenvectors")
-
-        plt.tight_layout()
-        plt.show()
+        diff = qSp - pSp
         
-        # Plot Any Comparations
-        for i in range(nsols - 1):
-            print(f"\nComparing Level {i + 1} to upper levels.")
-            pontosOrt = []      # For nonzero deviations.
-            pontosOrtZero = []  # For zero deviations.
-            for j in range(i + 1, nsols):
-                # Calculates the orthogonality error
-                err = abs(self.__scalar_product(sols[i][1], sols[j][1]))
-                err_scaled = err 
-                if np.isclose(err_scaled, 0, atol=1e-15):
-                    pontosOrtZero.append((j + 1, 0))
-                else:
-                    pontosOrt.append((j + 1, math.log10(err_scaled)))
-            
+        # Calculate percentages safely
+        with np.errstate(divide='ignore', invalid='ignore'):
+            percent = (diff / np.abs(pSp)) * 100
+        percent[np.isnan(percent)] = 0  # Fix 0/0 cases
+        
+        levels = np.arange(1, n_levels + 1)
+
+        # Plotting Helper
+        def plot_comparison(y_data, title, y_label, log_scale=False):
             plt.figure(figsize=(10, 5))
-            if pontosOrt:
-                pts_ort = np.array(pontosOrt)
-                plt.plot(pts_ort[:, 0], pts_ort[:, 1], 'r-o', label="Non-zero deviation")
-                tick_interval = max(1, nsols // 10)
-                plt.xticks(np.arange(i + 2, nsols + 1, tick_interval), rotation=45)
-                # Obtains the real values (undoing the log) to determine a suitable linthresh.
-                real_vals = [10 ** y for y in pts_ort[:, 1] if y != 0]
-                if real_vals:
-                    linthresh = max(1e-8, np.min(real_vals))
-                    plt.yscale('symlog', linthresh=linthresh)
-                    y_min, y_max = np.min(pts_ort[:, 1]), np.max(pts_ort[:, 1])
-                    plt.ylim(y_min - 0.1, y_max + 0.1)
-                else:
-                    plt.yscale('symlog')
-            if pontosOrtZero:
-                pts_ort0 = np.array(pontosOrtZero)
-                plt.plot(pts_ort0[:, 0], pts_ort0[:, 1], 'g-o', label="Zero deviation")
             
+            # Boolean masks for coloring
+            mask_pos = y_data > 1e-15
+            mask_neg = y_data < -1e-15
+            mask_null = ~mask_pos & ~mask_neg # Approximately zero
+
+            if log_scale:
+                # Transform data for log plot, handling signs
+                y_plot = np.zeros_like(y_data)
+                y_plot[mask_pos] = np.log10(y_data[mask_pos])
+                y_plot[mask_neg] = np.log10(np.abs(y_data[mask_neg]))
+                y_plot[mask_null] = 0 # Placeholder for zero
+                
+                if np.any(mask_pos): plt.scatter(levels[mask_pos], y_plot[mask_pos], c='blue', label="Positive (log10)")
+                if np.any(mask_neg): plt.scatter(levels[mask_neg], y_plot[mask_neg], c='red', label="Negative (log10)")
+                if np.any(mask_null): plt.scatter(levels[mask_null], y_plot[mask_null], c='green', label="Zero")
+                plt.ylabel(f"log10(|{y_label}|)")
+            else:
+                if np.any(mask_pos): plt.scatter(levels[mask_pos], y_data[mask_pos], c='blue', label="Positive")
+                if np.any(mask_neg): plt.scatter(levels[mask_neg], y_data[mask_neg], c='red', label="Negative")
+                if np.any(mask_null): plt.scatter(levels[mask_null], y_data[mask_null], c='green', label="Zero")
+                plt.ylabel(y_label)
+
             plt.xlabel("Energy level")
-            plt.ylabel("log10(|<vi, vj>|)")
-            plt.title(f"Orthogonality error: Level {i + 1} compared to upper levels")
-            
-            ax = plt.gca()
-            # Defines minor ticks for higher resolution and formats the y-axis in scientific notation.
-            ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
-            ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
-            ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2e'))
-            plt.legend()
+            plt.title(title)
+            plt.grid(True, alpha=0.3)
+            plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
             plt.tight_layout()
-            plt.xlim(i + 2, nsols + 0.5)
             plt.show()
 
+        # Plot 1: Absolute Variations
+        print("-" * 80); print("Log10 Absolute Variation.\n")
+        plot_comparison(diff, f"Log10 absolute variations (lowest {n_levels} levels)", "Variation", log_scale=True)
+
+        # Plot 2: Percent Variations
+        print("-" * 80); print("Percent variation.\n")
+        plot_comparison(percent, f"Percent variations (lowest {n_levels} levels)", "Percent (%)", log_scale=False)
+
+        # 4. Orthogonality Analysis
+        print("-" * 80); print("Comparing orthogonality of eigenvectors (dot product).\n")
+        
+        sols = self.its_eigenpairs(save_to_file=False)
+        vecs = [s[1] for s in sols] # Extract vectors
+        nsols = len(vecs)
+        
+        # Build Deviation Matrix
+        ort_matrix = np.zeros((nsols, nsols))
+        for i in range(nsols):
+            for j in range(i + 1, nsols):
+                # We calculate upper triangle
+                val = abs(self.__scalar_product(vecs[i], vecs[j]))
+                ort_matrix[i, j] = val
+                ort_matrix[j, i] = val # Symmetric
+
+        # Plot Heatmap
+        plt.figure(figsize=(8, 6))
+        # Add epsilon to avoid log(0)
+        im = plt.imshow(np.log10(ort_matrix + 1e-30), cmap="viridis", origin="lower", aspect="auto")
+        plt.colorbar(im, label="log10(|<vi,vj>|)")
+        plt.xlabel("Level i"); plt.ylabel("Level j")
+        plt.title("Orthogonality deviation (Heatmap)")
+        plt.tight_layout()
+        plt.show()
+
+        # Detailed Per-Level Plots
+        # Warning: This loop creates a plot for EVERY level. Can be heavy.
+        print("Generating individual orthogonality plots...")
+        
+        for i in range(nsols - 1):
+            # Extract row i, columns from i+1 onwards
+            upper_indices = np.arange(i + 1, nsols)
+            errors = ort_matrix[i, i+1:]
+
+            plt.figure(figsize=(10, 4))
+            
+            # Separate zero vs non-zero for plotting style
+            mask_nz = errors > 1e-15
+            mask_z = ~mask_nz
+            
+            x_vals = upper_indices + 1 # 1-based indexing for display
+            
+            if np.any(mask_nz):
+                # Log scale for non-zeros
+                y_vals = np.log10(errors[mask_nz])
+                plt.plot(x_vals[mask_nz], y_vals, 'r-o', label="Non-zero deviation")
+                
+                # Dynamic Y-limit handling
+                y_min, y_max = np.min(y_vals), np.max(y_vals)
+                if y_min == y_max: y_max += 1.0; y_min -= 1.0
+                plt.ylim(y_min - 0.5, y_max + 0.5)
+                
+            if np.any(mask_z):
+                # Plot zeros at the bottom or separate visual
+                # Since Y is log scale, we can't plot 0. We usually skip or plot at bottom limit.
+                plt.plot(x_vals[mask_z], np.full(np.sum(mask_z), -16), 'g.', label="Zero (< 1e-15)")
+
+            plt.xlabel("Energy level")
+            plt.ylabel("log10(|<vi, vj>|)")
+            plt.title(f"Orthogonality error: Level {i + 1} vs upper levels")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+    @safe_execution
     def check_solutions_numerically(self):
         """
             Numerically verifies the solutions (eigenvalues and eigenvectors) according to the following criteria:
@@ -2820,19 +3237,24 @@ class SpectralMethod:
             (3) Orthogonality deviation: For each pair (vi, vj), calculates ⟨vi, vj⟩.
 
             - The results are saved in text files for further analysis.
-
-            - Note:  
-            It is assumed that FirstBigMatrix() and SecondBigMatrix() are already implemented,  
-            and that the spectrum (sols) is obtained via its_eigenvectors(), returning a list of pairs [E, v].
         """
         if not self.has_eigenvectors_been_calculated:
             print("Please solve the eigenvalue and eigenvector problem first.")
             return
 
-        # ------------------ 1. Verification: Substitution in M(E)v = 0 ------------------
-        filename_eq = f"{self.root_filename}_Check_Equations.txt"
-        print("Reporting errors in equations in file:", filename_eq)
+        # Retrieve solutions
+        sols = self.eigenvectors
+        nsols = len(sols)
         
+        # Construct the matrices ONLY ONCE outside the loop
+        print("Building matrices for verification...")
+        M1 = self.__FirstBigMatrix()
+        M2 = self.__SecondBigMatrix()
+
+        # ------------------ 1. Verification: Substitution in M(E)v = 0 ------------------
+        filename_eq = f"{self.root_filename}/{self.root_filename}_Check_Equations.txt"
+        print(f"Reporting errors in equations in file: {filename_eq}")
+
         header_eq = (
             f"# Maximum absolute error obtained after substitution of (v,E) in the eigenvector equation M(E)v=0\n"
             f"# Filename:           {filename_eq}\n"
@@ -2843,28 +3265,26 @@ class SpectralMethod:
             "# (1) Energy Level\t(2) Error\n"
             f"# " + "="*80 + "\n"
         )
+        
         with open(filename_eq, "w", encoding='utf-8') as f:
             f.write(header_eq)
-
-        # Retrieves the solutions (list of `[E, eigenvector]`).
-        sols = self.eigenvectors
-        nsols = len(sols)
-        
-        # For each solution, calculates `M_E = FirstBigMatrix() - E * SecondBigMatrix()`  
-        # and finds the maximum error.
-        for i in range(nsols):
-            E = sols[i][0]
-            v = np.array(sols[i][1])
-            M_E = self.__FirstBigMatrix() - E * self.__SecondBigMatrix()
-            Av = M_E.dot(v)
-            err = np.max(np.abs(Av))
-            with open(filename_eq, "a") as f:
+            
+            for i in range(nsols):
+                E = sols[i][0]
+                v = np.array(sols[i][1])
+                
+                # Calculates: (M1 - E*M2) * v
+                term1 = M1.dot(v)
+                term2 = M2.dot(v)
+                residue = term1 - (E * term2)
+                
+                err = np.max(np.abs(residue))
                 f.write(f"{i+1}\t{err:.20e}\n")
 
         # ------------------ 2. Verification: Normality of Eigenvectors ------------------
-        filename_norm = f"{self.root_filename}_Check_Normality.txt"
-        print("Reporting errors in eigenvector normality in file:", filename_norm)
-        
+        filename_norm = f"{self.root_filename}/{self.root_filename}_Check_Normality.txt"
+        print(f"Reporting errors in eigenvector normality in file: {filename_norm}")
+
         header_norm = (
             "# Checking deviation from normality of eigenvectors (dot product).\n"
             f"# Filename:           {filename_norm}\n"
@@ -2875,20 +3295,18 @@ class SpectralMethod:
             "# (1) Energy Level\t(2) Error\n"
             "# " + "="*80 + "\n"
         )
+        
         with open(filename_norm, "w", encoding='utf-8') as f:
             f.write(header_norm)
-        
-        for i in range(nsols):
-            # v should be interpreted as stored; assumes self.__scalar_product is defined.
-            v = sols[i][1]
-            err = abs(1 - self.__scalar_product(v, v))
-            with open(filename_norm, "a") as f:
+            for i in range(nsols):
+                v = sols[i][1]
+                err = abs(1 - self.__scalar_product(v, v))
                 f.write(f"{i+1}\t{err:.20e}\n")
-        
+
         # ------------------ 3. Verification: Orthogonality between Eigenvectors ------------------
-        filename_ortho = f"{self.root_filename}_Check_Orthogonality.txt"
-        print("Reporting errors in eigenvector orthogonality in file:", filename_ortho)
-        
+        filename_ortho = f"{self.root_filename}/{self.root_filename}_Check_Orthogonality.txt"
+        print(f"Reporting errors in eigenvector orthogonality in file: {filename_ortho}")
+
         header_ortho = (
             "# Checking deviation from orthogonality of eigenvectors (dot product).\n"
             f"# Filename:           {filename_ortho}\n"
@@ -2899,22 +3317,24 @@ class SpectralMethod:
             "# Level i,\tLevel j,\tError\n"
             "# " + "="*80 + "\n"
         )
+        
         with open(filename_ortho, "w", encoding='utf-8') as f:
             f.write(header_ortho)
-        
-        # For each pair (i, j) with i < j, calculates the dot product and records the error (saving only the real part).
-        for i in range(nsols):
-            for j in range(i+1, nsols):
-                err = self.__scalar_product(sols[i][1], sols[j][1])
-                if not np.isclose(np.imag(err), 0, atol=1e-15):
-                    print(f"Warning: scalar product of levels {i+1} and {j+1} yielded a complex number. Recording just the real part.")
-                err = np.real(err)
-                with open(filename_ortho, "a") as f:
+            for i in range(nsols):
+                # Upper-triangular loop (j > i) avoids recomputing symmetric pairs and the diagonal
+                for j in range(i+1, nsols):
+                    val = self.__scalar_product(sols[i][1], sols[j][1])
+                    
+                    if not np.isclose(np.imag(val), 0, atol=1e-15):
+                        print(f"Warning: scalar product of levels {i+1} and {j+1} complex. Recording real part.")
+                    
+                    err = np.real(val)
                     f.write(f"{i+1}\t{j+1}\t{err:.20e}\n")
-        
-        print("Done.")
-        
-    def check_solutions_graphically(self, save: bool = True, show: bool = True):
+
+        print("Numerical verification Done.")
+
+    @safe_execution
+    def check_solutions_graphically(self, save: bool = True, show: bool = True, force_recalc: bool = False):
         """
             Graphically checks the quality of eigenvalues/eigenvectors:
             - Substitution errors (Mv ≈ 0)
@@ -2922,289 +3342,258 @@ class SpectralMethod:
             - Orthogonality deviations (<vi,vj> ≈ 0)
 
             If the check files already exist, use their data.
-            Otherwise, recalculate.
+            Otherwise, call check_solutions_numerically().
         """
-
         if not self.has_eigenvectors_been_calculated:
             print("Please solve the eigenvalue and eigenvector problem first.")
             return
 
-        sols = self.eigenvectors
-        nsols = len(sols)
+        # Expected filenames
+        f_eq = f"{self.root_filename}/{self.root_filename}_Check_Equations.txt"
+        f_norm = f"{self.root_filename}/{self.root_filename}_Check_Normality.txt"
+        f_ortho = f"{self.root_filename}/{self.root_filename}_Check_Orthogonality.txt"
+        
+        files_exist = os.path.exists(f_eq) and os.path.exists(f_norm) and os.path.exists(f_ortho)
 
-        # ---------------- Substitution Error ----------------
-        print("-"*80)
-        print("---------------- Substitution Error ----------------")
-        filename_eq = f"{self.root_filename}_Check_Equations.txt"
-        errors_subst = []
+        # If any file is missing or forced, compute everything before proceeding
+        if not files_exist or force_recalc:
+            print("Data files for graphical check missing or outdated. Running numerical check first...")
+            self.check_solutions_numerically()
 
-        if os.path.exists(filename_eq):
-            print(f"Reading substitution errors {filename_eq}")
-            data = np.loadtxt(filename_eq, comments="#")
-            for row in data:
-                level, err = int(row[0]), float(row[1])
-                log_err = np.log10(err) if err > 0 else -30
-                errors_subst.append((level, log_err))
-        else:
-            print("Calculating substitution errors...")
-            for i, (E, v) in enumerate(sols, start=1):
-                M_E = self.__FirstBigMatrix() - E * self.__SecondBigMatrix()
-                err = np.max(np.abs(M_E.dot(v)))
-                log_err = np.log10(err) if err > 0 else -30
-                errors_subst.append((i, log_err))
+        # --- From this point on, it is guaranteed that the files exist. Only READ and PLOT. ---
+        
+        # Plot Substitution Error
+        data = np.loadtxt(f_eq, comments="#")
+        # Safeguard in case the file has only one line (becomes a 1D array)
+        if data.ndim == 1: data = data.reshape(1, -1) 
+        
+        levels = data[:, 0]
+        # Safe handling for log10
+        errors = data[:, 1]
+        log_errors = np.where(errors > 0, np.log10(errors), -30)
 
-        plt.figure(figsize=(10, 5))
-        pts = np.array(errors_subst)
-        plt.plot(pts[:, 0], pts[:, 1], 'r-o', label="log10(|M(E)v|)")
-        plt.xlabel("En. level")
-        plt.ylabel("log10(|error|)")
-        plt.title("Substitution error in eigenvector equation")
-        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
+        self.__plot_scatter(levels, log_errors, 
+                            title="Substitution error in eigenvector equation",
+                            ylabel="log10(|error|)", 
+                            filename_suffix="Check_Substitution",
+                            color='ro', save=save, show=show)
 
-        ax = plt.gca()
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-        ax.xaxis.set_minor_locator(MultipleLocator(5))
-        ax.yaxis.set_minor_locator(MultipleLocator(1))
-        plt.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
-        if save:
-            plt.savefig(f"{self.root_filename}_Check_Substitution.png", dpi=300)
-        if show:
-            plt.show()
-        else:
-            plt.close()
+        # Plot Normality Deviation
+        data = np.loadtxt(f_norm, comments="#")
+        if data.ndim == 1: data = data.reshape(1, -1)
+        
+        levels = data[:, 0]
+        errors = data[:, 1]
+        log_errors = np.where(errors > 0, np.log10(errors), -30)
 
-        # ---------------- Normality Deviation ----------------
-        print("-"*80)
-        print("---------------- Normality Deviation ----------------")
-        filename_norm = f"{self.root_filename}_Check_Normality.txt"
-        errors_norm = []
+        self.__plot_scatter(levels, log_errors, 
+                            title="Normality deviation of eigenvectors",
+                            ylabel="log10(|1 - <v,v>|)", 
+                            filename_suffix="Check_Normality",
+                            color='bo', save=save, show=show)
 
-        if os.path.exists(filename_norm):
-            print(f"Reading deviations from normality of {filename_norm}")
-            data = np.loadtxt(filename_norm, comments="#")
-            for row in data:
-                level, err = int(row[0]), float(row[1])
-                log_err = np.log10(err) if err > 0 else -30
-                errors_norm.append((level, log_err))
-        else:
-            print("Calculating deviations from normality...")
-            for i, (_, v) in enumerate(sols, start=1):
-                err = abs(1 - self.__scalar_product(v, v))
-                log_err = np.log10(err) if err > 0 else -30
-                errors_norm.append((i, log_err))
+        # Plot Orthogonality (Summary 1D)
+        # We need to process the orthogonality file to extract the maximum per level
+        data_ortho = np.loadtxt(f_ortho, comments="#")
+        if data_ortho.ndim == 1: data_ortho = data_ortho.reshape(1, -1)
+        
+        # Dictionary to track the maximum error per level
+        max_err_per_level = {}
+        nsols = len(self.eigenvectors)
+        
+        # Inicialize
+        for i in range(1, nsols + 1):
+            max_err_per_level[i] = -30.0 # Low baseline value for log scale
 
-        plt.figure(figsize=(10, 5))
-        pts = np.array(errors_norm)
-        plt.plot(pts[:, 0], pts[:, 1], 'bo-', label="log10(|1 - <v,v>|)")
-        plt.xlabel("En. level")
-        plt.ylabel("log10(|1 - <v,v>|)")
-        plt.title("Normality deviation of eigenvectors")
-        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
-       
-        ax = plt.gca()
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-        ax.xaxis.set_minor_locator(MultipleLocator(5))
-        ax.yaxis.set_minor_locator(MultipleLocator(1))
-        plt.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
-        if save:
-            plt.savefig(f"{self.root_filename}_Check_Normality.png", dpi=300)
-        if show:
-            plt.show()
-        else:
-            plt.close()
-
-        # ---------------- Orthogonality Summary (1D curve) ----------------
-        print("-"*80)
-        print("---------------- Creating summary plot of orthogonality deviation (max per level) ----------------")
-
-        ortho_summary = []
-        for i in range(nsols):
-            errs_i = []
-            for j in range(nsols):
-                if i != j:
-                    err = abs(self.__scalar_product(sols[i][1], sols[j][1]))
-                    log_err = np.log10(err) if err > 0 else -30
-                    errs_i.append(log_err)
-            if errs_i:
-                ortho_summary.append((i+1, max(errs_i)))  # pega o pior caso
-
-        plt.figure(figsize=(10, 5))
-        pts = np.array(ortho_summary)
-        plt.plot(pts[:, 0], pts[:, 1], 'r-o', label="log10(|<vi,vj>|) max")
-        plt.xlabel("Energy level")
-        plt.ylabel("log error in orthogonality")
-        plt.title("Maximum orthogonality deviation per level")
-        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
-
-        ax = plt.gca()
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-        ax.xaxis.set_minor_locator(MultipleLocator(5))
-        ax.yaxis.set_minor_locator(MultipleLocator(1))
-
-        plt.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
-        if save:
-            plt.savefig(f"{self.root_filename}_Check_Orthogonality_Summary.png", dpi=300)
-        if show:
-            plt.show()
-        else:
-            plt.close()
+        for row in data_ortho:
+            i, j, err = int(row[0]), int(row[1]), abs(float(row[2]))
+            val_log = np.log10(err) if err > 0 else -30
             
-        # ---------------- Orthogonality Summary (2D curve) ----------------
-        print("-"*80)
-        print("---------------- Orthogonality Summary (2D curve) ----------------")
-        filename_ortho = f"{self.root_filename}_Check_Orthogonality.txt"
-        errors_ortho = []
+            # Update the maximum for i and j (orthogonality is symmetric)
+            if val_log > max_err_per_level[i]: max_err_per_level[i] = val_log
+            if val_log > max_err_per_level[j]: max_err_per_level[j] = val_log
 
-        if os.path.exists(filename_ortho):
-            print(f"Reading orthogonality deviations from {filename_ortho}")
-            data = np.loadtxt(filename_ortho, comments="#")
-            for row in data:
-                i, j, err = int(row[0]), int(row[1]), float(row[2])
-                log_err = np.log10(abs(err)) if err != 0 else -30
-                errors_ortho.append((i, j, log_err))
+        # Prepare arrays for plotting
+        levels_ortho = sorted(max_err_per_level.keys())
+        vals_ortho = [max_err_per_level[k] for k in levels_ortho]
+
+        self.__plot_scatter(levels_ortho, vals_ortho, 
+                            title="Maximum orthogonality deviation per level",
+                            ylabel="log error in orthogonality", 
+                            filename_suffix="Check_Orthogonality_Summary",
+                            color='ro', save=save, show=show)
+
+        # Plot Orthogonality (2D Map)
+        # Plot directly from the loaded data
+        self.__plot_2d_ortho(data_ortho, save=save, show=show)
+
+        print("Graphical check Done.")
+
+    # --- Auxiliary plotting functions to keep the code clean ---
+    @safe_execution
+    def __plot_scatter(self, x, y, title, ylabel, filename_suffix, color, save, show):
+        """Helper function for standard 1D plotting."""
+        plt.figure(figsize=(10, 5))
+        plt.plot(x, y, color, label=ylabel)
+        plt.xlabel("En. level")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.legend(loc="upper left", bbox_to_anchor=(1.00, 1))
+        
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
+        plt.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
+        
+        if save:
+            plt.savefig(f"{self.root_filename}/{self.root_filename}_{filename_suffix}.png", dpi=2000)
+        if show:
+            plt.show()
         else:
-            print("Calculating orthogonality deviations...")
-            for i in range(nsols):
-                for j in range(i+1, nsols):
-                    err = abs(self.__scalar_product(sols[i][1], sols[j][1]))
-                    log_err = np.log10(err) if err > 0 else -30
-                    errors_ortho.append((i+1, j+1, log_err))
+            plt.close()
+    
+    @safe_execution
+    def __plot_2d_ortho(self, data, save, show):
+        """Helper function for 2D orthogonality plots."""
+        print("-" * 80)
+        print("---------------- Orthogonality Summary (2D curve) ----------------")
+        
+        i_s = data[:, 0]
+        j_s = data[:, 1]
+        errs = np.abs(data[:, 2])
+        log_errs = np.where(errs > 0, np.log10(errs), -30)
 
         plt.figure(figsize=(10, 5))
-        pts = np.array(errors_ortho)
-        sc = plt.scatter(pts[:, 0], pts[:, 1], c=pts[:, 2], cmap="viridis", marker="o")
+        sc = plt.scatter(i_s, j_s, c=log_errs, cmap="viridis", marker="o")
         plt.colorbar(sc, label="log10(|<vi,vj>|)")
         plt.xlabel("Level i")
         plt.ylabel("Level j")
         plt.title("Orthogonality deviation between eigenvectors")
-       
+        
         ax = plt.gca()
         ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-        ax.xaxis.set_minor_locator(MultipleLocator(5))
-        ax.yaxis.set_minor_locator(MultipleLocator(1))
         plt.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
+        
         if save:
-            plt.savefig(f"{self.root_filename}_Check_Orthogonality.png", dpi=300)
+            plt.savefig(f"{self.root_filename}/{self.root_filename}_Check_Orthogonality.png", dpi=2000)
         if show:
             plt.show()
         else:
             plt.close()
+    # ---
 
-        print("="*80)
-        print("Done.")
-
+    @safe_execution
     def check_equations(self, filename: str) -> None:
-            """
-                Checks whether each eigenvalue-eigenvector pair approximately satisfies the equation  
-                M v = 0, where M = (F - E * S),  
-                with F and S being the matrices obtained from build_matrix_d() and build_matrix_d_prime().  
+        """
+            Checks whether each eigenvalue-eigenvector pair approximately satisfies the equation  
+            M v = 0, where M = (F - E * S),  
+            with F and S being the matrices obtained from build_matrix_d() and build_matrix_d_prime().  
 
-                Procedure:  
-                1. Checks whether the spectrum and eigenvectors have already been computed.  
-                2. Opens (or creates) the file specified in filename and writes a header including:  
-                - The number of digits used,  
-                - The file name,  
-                - The program version,  
-                - The start date/time.  
-                3. For each eigenvalue E and its corresponding eigenvector v, computes:  
+            Procedure:  
+            1. Checks whether the spectrum and eigenvectors have already been computed.  
+            2. Opens (or creates) the file specified in filename and writes a header including:  
+            - The number of digits used,  
+            - The file name,  
+            - The program version,  
+            - The start date/time.  
+            3. For each eigenvalue E and its corresponding eigenvector v, computes:  
 
-                error = max( |(F - E * S) @ v| )  
+            error = max( |(F - E * S) @ v| )  
 
-                This value measures the error in satisfying the equation.  
-                4. The results are written to the file.  
+            This value measures the error in satisfying the equation.  
+            4. The results are written to the file.  
 
-                Args:  
-                - filename (str): Name of the file where results will be saved.  
+            Args:  
+            - filename (str): Name of the file where results will be saved.  
 
-                Returns:  
-                - None.  
-            """
-            if not (self.has_spectrum_been_calculated and self.has_eigenvectors_been_calculated):
-                    #raise RuntimeError("No eigenvectors have been computed yet.")
-                    print("No eigenvectors have been computed yet. " )
-                    self.calculate_eigenvectors()
-                    self.calculate_spectrum()
+            Returns:  
+            - None.  
+        """
+        if filename is None:
+            filename = f"{self.root_filename}/{self.root_filename}_Check_Equations.txt"
 
-            digits = self.digits_used
+        if not (self.has_spectrum_been_calculated and self.has_eigenvectors_been_calculated):
+                print("No eigenvectors have been computed yet. " )
+                self.calculate_eigenvectors()
+                self.calculate_spectrum()
+
+        digits = self.digits_used
+            
+        # Defines the file header.
+        header_lines = [
+            f"# Checking maximum errors in satisfying eigenvalue equation. Digits used: {digits}",
+            f"# Filename: {filename}",
+            f"# Program version: {self.version}",
+            f"# Started in: {time.strftime('%c')}",
+            f"#{'='*80}",
+            "# (1) En. Level\t(2) Error",
+            f"#{'='*80}"
+        ]
+        # Opens the file in write mode (overwriting the current file, if it exists).
+        with open(filename, "w", encoding='utf-8') as f:
+            for line in header_lines:
+                f.write(line + "\n")
+            
+        # Defines the matrices F and S.
+        F = self.__build_matrix_d()
+        S = self.__build_matrix_d_prime()
+            
+        # Checks for each level: it calculates Mv, that is, (F - E * S) @ v.
+        with open(filename, "a", encoding='utf-8') as f:
+            for i in range(self.num_levels):
+                E_i = self.en_spectrum[i]
+                v_i = np.array(self.eigenvectors[i])
                 
-            # Defines the file header.
-            header_lines = [
-                f"# Checking maximum errors in satisfying eigenvalue equation. Digits used: {digits}",
-                f"# Filename: {filename}",
-                f"# Program version: {self.version}",
-                f"# Started in: {time.strftime('%c')}",
-                f"#{'='*80}",
-                "# (1) En. Level\t(2) Error",
-                f"#{'='*80}"
-            ]
-            # Opens the file in write mode (overwriting the current file, if it exists).
-            with open(filename, "w", encoding='utf-8') as f:
-                for line in header_lines:
-                    f.write(line + "\n")
+                # CEnsures that v_i is a column vector; otherwise, it converts it.
+                if v_i.ndim == 1:
+                    v_i = v_i[:, np.newaxis]  
                 
-            # Defines the matrices F and S.
-            F = self.__build_matrix_d()
-            S = self.__build_matrix_d_prime()
+                M = F - E_i * S
+                # Calculates the maximum error (maximum absolute value of the components of M @ v)
+                error_val = np.max(np.abs(M @ v_i))
                 
-            # Checks for each level: it calculates Mv, that is, (F - E * S) @ v.
-            with open(filename, "a", encoding='utf-8') as f:
-                for i in range(self.num_levels):
-                    E_i = self.en_spectrum[i]
-                    v_i = np.array(self.eigenvectors[i])
-                    
-                    # CEnsures that v_i is a column vector; otherwise, it converts it.
-                    if v_i.ndim == 1:
-                        v_i = v_i[:, np.newaxis]  
-                    
-                    M = F - E_i * S
-                    # Calculates the maximum error (maximum absolute value of the components of M @ v)
-                    error_val = np.max(np.abs(M @ v_i))
-                    
-                    # Tolerance for very small error
-                    tolerance = 1e-15
-                    if error_val < tolerance:
-                        error_val = 0  # Ignores very small errors, in case the system is highly precise.
-                    
-                    # Writes the level (adjusted to start at 1) and the error
-                    f.write(f"{i+1}\t{error_val}\n")
+                # Tolerance for very small error
+                tolerance = 1e-15
+                if error_val < tolerance:
+                    error_val = 0  # Ignores very small errors, in case the system is highly precise.
+                
+                # Writes the level (adjusted to start at 1) and the error
+                f.write(f"{i+1}\t{error_val}\n")
 
+    @safe_execution
     def relate_unsorted_and_sorted_lists(self, unsorted):
-            """
-                Sorts a list and relates it to the original unsorted list.  
+        """
+            Sorts a list and relates it to the original unsorted list.  
 
-                Example:  
-                Given:  
-                ```python
-                unsorted = [5, 3, 2, 1, 4]
-                ```  
-                Returns:  
-                ```python
-                sorted_list = [1, 2, 3, 4, 5]
-                mapping      = [4, 3, 2, 5, 1]
-                ```
-                The mapping indicates:  
-                - The 1st element in the sorted list (1) was originally in the 4th position.  
-                - The 2nd element (2) was originally in the 3rd position, and so on.  
+            Example:  
+            Given:  
+            ```python
+            unsorted = [5, 3, 2, 1, 4]
+            ```  
+            Returns:  
+            ```python
+            sorted_list = [1, 2, 3, 4, 5]
+            mapping      = [4, 3, 2, 5, 1]
+            ```
+            The mapping indicates:  
+            - The 1st element in the sorted list (1) was originally in the 4th position.  
+            - The 2nd element (2) was originally in the 3rd position, and so on.  
 
-                Args:  
-                - unsorted (list): List of elements (must have distinct values).  
+            Args:  
+            - unsorted (list): List of elements (must have distinct values).  
 
-                Returns:  
-                - tuple: (sorted_list, mapping), where mapping is 1-based.  
-            """
-            if len(unsorted) != len(set(unsorted)):
-                raise ValueError("The list must contain distinct values.")
+            Returns:  
+            - tuple: (sorted_list, mapping), where mapping is 1-based.  
+        """
+        if len(unsorted) != len(set(unsorted)):
+            raise ValueError("The list must contain distinct values.")
 
-            # Get the sorted list and keep track of the original indices using enumerate
-            sorted_list = sorted(unsorted)
-            mapping = [index + 1 for value, index in sorted([(value, idx) for idx, value in enumerate(unsorted)], key=lambda x: x[0])]
+        # Get the sorted list and keep track of the original indices using enumerate
+        sorted_list = sorted(unsorted)
+        mapping = [index + 1 for value, index in sorted([(value, idx) for idx, value in enumerate(unsorted)], key=lambda x: x[0])]
 
-            return sorted_list, mapping
+        return sorted_list, mapping
 
+    @safe_execution
     def mydensityplot(self, aux, x_label, a, b, N=200, cmap='gray_r'):
         """
             Generates a density plot ("cartoon") for the function aux over the interval [a, b].  
@@ -3261,116 +3650,322 @@ class SpectralMethod:
         
         return fig, ax
     
-# --- Method for Compute Optimal L ---
-
-    def __build_D_at(self, L: float) -> np.ndarray:
-        """
-        Monta a matriz D(L) = T(L) + C(L) sem alterar permanentemente self.length.
-        """
-        old_L = self.length
-        self.length = L
-        D = self.__build_matrix_d()    
-        self.length = old_L
-        return D
- 
-    def __energy_ground_state(self, L: float) -> float:
-        """
-        Returns the smallest eigenvalue of D(L), i.e., E₀(L).
-        """
-        D = self.__build_D_at(L)
-        # returns the eigenvalues in ascending order.
-        return np.linalg.eigh(D)[0][0]
- 
-    def optimize_length(self, L_min = 0.1, L_max = None, xatol=1e-15):
-        """
-        Searches in [L_min, L_max] for the L that minimizes E₀(L).
-        """
-        L_max = 5*self.length
-        
-        res = minimize_scalar(
-            lambda L: self.__energy_ground_state(L),
-            bounds=(L_min, L_max),
-            method='bounded',
-            options={'xatol': xatol}
-        )
-        return res.x   
-
-    def optimal_L(self, L=10):
-        """
-        Determines the optimal L for the 1D Schrödinger equation using the spectral method.
-
-        Parameters
-        ----------
-        L : float
-            Initial guess for the domain length.
-
-        Returns
-        -------
-        L_optimal : float
-            Optimal value of L.
-        E0 : float
-            Ground-state energy (lowest eigenvalue of the Hamiltonian).
-
-        """
-
-        tol = 1e-4
-        V = self.f_function          # potential V(x)
-        N = self.num_levels          # Number of basis functions.
-        weight_function = self.weight
-        L_guess = L
-
-        def energy_for_L(L):
-            """Calcula a energia fundamental para um dado L."""
-            m_values = np.arange(1, N + 1)
-
-            # Kinetic matrix (diagonal).
-            # Normalization: <sin(mπx/L), sin(nπx/L)> = L/2 δ_mn
-            K = np.diag((np.pi**2) * (m_values**2) / (2 * L**2))
-
-            # Potential matrix
-            V_mat = np.zeros((N, N))
-
-            def integrand(x, m, n):
-                psi_m = np.sqrt(2/L) * np.sin((m * np.pi * x) / L)
-                psi_n = np.sqrt(2/L) * np.sin((n * np.pi * x) / L)
-                return psi_m * V(x) * psi_n * weight_function(x)
-
-            for i in range(N):
-                for j in range(i, N):
-                    m_val, n_val = i + 1, j + 1
-                    try:
-                        integral, _ = fixed_quad(integrand, 0, L, args=(m_val, n_val), n=10000)
-                    except Exception:
-                        integral = 0.0
-                    V_mat[i, j] = integral
-                    if i != j:
-                        V_mat[j, i] = integral
-
-            H = K + V_mat
-
-            # Smallest eigenvalue (ground-state energy)
-            try:
-                E0 = eigsh(H, k=1, which='SA', return_eigenvectors=False)[0]
-            except Exception:
-                E0 = np.linalg.eigh(H)[0][0]
-
-            return E0
-
-        # Minimization with respect to L.
-        result = minimize_scalar(
-            lambda L: energy_for_L(L),
-            bounds=(0.1, 5 * L_guess),
-            method='bounded',
-            tol=tol
-        )
-
-        L_optimal = result.x
-        E0 = result.fun
-
-        return L_optimal, E0
+# ----- Method for Compute Optimal L ----- 
     
-# --- Method for Unified Compute ---
+    @contextmanager
+    def _temporary_state(self, **kwargs):
+        """
+            Context manager to temporarily modify instance attributes.
 
+            - Validates critical parameters (`length`, `num_levels` must be positive).
+            - Applies temporary values from `kwargs` and saves originals.
+            - Clears caches; reinitializes if `length` is changed.
+            - Logs changes if `debug_mode` is enabled.
+            - Restores original values when exiting the context, even on errors.
+        """
+
+        old_values = {}
+        context_id = id(self)  # debug
+        
+        try:
+            # Validation
+            if 'length' in kwargs and kwargs['length'] <= 0:
+                raise ValueError(f"length must be positive, got {kwargs['length']}")
+            if 'num_levels' in kwargs and kwargs['num_levels'] <= 0:
+                raise ValueError(f"num_levels must be positive, got {kwargs['num_levels']}")
+            
+            # Save current values
+            for key, value in kwargs.items():
+                old_values[key] = getattr(self, key)
+                setattr(self, key, value)
+            
+            # DEBUG: Log attribute changes
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                print(f"[DEBUG] Context {context_id}: entering with {kwargs}")
+                if 'length' in kwargs:
+                    print(f"       L changed from {old_values.get('length')} to {kwargs['length']}")
+            
+            # ALWAYS clear all caches
+            self.clear_caches()
+            
+            # Force recomputation of critical integrals
+            if 'length' in kwargs:
+                # Reinitialize caches with fresh dictionaries
+                self._weight_cache = {}
+                self._f_integral_cache = {}
+                self._g_integral_cache = {}
+            
+            yield self
+            
+        except Exception as e:
+            # Log the error before restoring state
+            print(f"[ERROR] In _temporary_state context {context_id}: {e}")
+            raise
+            
+        finally:
+            # Restore attribute values
+            for key, value in old_values.items():
+                setattr(self, key, value)
+            
+            # DEBUG: Log exit state
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                print(f"[DEBUG] Context {context_id}: exiting, restored {list(old_values.keys())}")
+
+    @safe_execution
+    def _optimization_energy(self, L: float, num_levels: int = None) -> float:
+        """
+        Raw version for the optimizer.
+        Avoids rounding to prevent artificial discontinuities in the cost function.
+
+        """
+        if num_levels is None:
+            num_levels = self.num_levels
+            
+        with self._temporary_state(length=L, num_levels=num_levels):
+            D = self.__build_matrix_d()
+            D_prime = self.__build_matrix_d_prime()
+            
+            try:
+                # Compute only the ground-state eigenvalue (index 0)
+                # Optimize with respect to the 5th excited state, since it enlarges the box, enhancing the global accuracy of the spectrum
+                target_idx = 4 
+                autovalores = eigh(
+                    D, 
+                    D_prime, 
+                    eigvals_only=True, 
+                    subset_by_index=[target_idx, target_idx],
+                    check_finite=True
+                    )
+               
+                result = float(autovalores[0])
+                
+                # Validação simples 
+                if abs(result) < np.finfo(float).eps * 100:
+                    return 0.0
+                return result
+
+            except np.linalg.LinAlgError:
+                return float('inf')
+            except ValueError:
+                return float('inf')
+            
+    @safe_execution
+    def optimize_length(self, num_levels_opt: int = None, L_bounds: tuple = (0.1, 50.0), verbose: bool = False) -> float:
+        """
+        Original method, now using improved find_optimal_L_for_N.
+        """
+        self.clear_caches()
+        
+        if num_levels_opt is None:
+            num_levels_opt = self.num_levels
+        
+        if verbose:
+            print("\n" + "="*50)
+            print(f"L OPTIMIZATION")
+            print(f"Number of basis functions: N = {num_levels_opt}")
+            print(f"Limits: L ∈ [{L_bounds[0]}, {L_bounds[1]}]")
+            print("="*50)
+        
+        L_opt = self.find_optimal_L_for_N(
+            N=num_levels_opt,
+            L_bounds=L_bounds,
+            verbose=verbose
+        )
+        
+        if verbose:
+            print(f"\nResult: L_opt = {L_opt:.15f}")
+            print("="*50)
+        
+        return L_opt
+    
+    @safe_execution
+    def find_optimal_L_for_N(self, N: int, L_bounds: tuple = (0.1, 50.0), verbose: bool = False) -> float:
+        """
+        Intelligent Hybrid Optimization:
+        Automatically distinguishes between potential wells ("Strings") and plateaus ("Oscillators")
+        by analyzing the energy landscape on the initial grid.
+        """
+        L_min, L_max = L_bounds
+        
+        # Local cache
+        energy_cache = {}
+
+        def energy_wrapper(val_L):
+            if val_L <= 0: return float('inf')
+            key = round(val_L, 10) 
+            if key in energy_cache: return energy_cache[key]
+            E = self._optimization_energy(val_L, N)
+            energy_cache[key] = E
+            return E
+
+        if verbose:
+            print(f"\n[OPTIMIZATION] N={N} | Range=[{L_min:.2f}, {L_max:.2f}]")
+
+        # Initial sampling (grid sweep)
+        L_vals = self._create_smart_sampling(L_min, L_max, N)
+        E_vals = np.array([energy_wrapper(l) for l in L_vals])
+        
+        valid_mask = np.isfinite(E_vals)
+        if not np.any(valid_mask): return (L_min + L_max) / 2.0
+        
+        L_valid = L_vals[valid_mask]
+        E_valid = E_vals[valid_mask]
+
+        # Noise analysis and tolerance: Take the best 10% of points to estimate the "floor"
+        idx_sorted = np.argsort(E_valid)
+        n_best = max(5, len(E_valid) // 10)
+        best_energies = E_valid[idx_sorted[:n_best]]
+        
+        min_E_grid = best_energies[0]
+        noise_floor = np.std(best_energies) if n_best > 1 else 0.0
+        
+        # Hybrid tolerance: For high energies, relative error dominates. For low/exact energies, numerical noise dominates.
+        rel_tol = 1e-12 
+        tolerance = max(noise_floor * 2.0, abs(min_E_grid) * rel_tol, 1e-13)
+
+        if verbose:
+            print(f"  > Grid Min: {min_E_grid:.14f}")
+            print(f"  > Tolerance: {tolerance:.2e}")
+
+        # Topological classification: Which L values in the grid produce energy "as good as" the minimum?
+        candidates_mask = (E_valid <= min_E_grid + tolerance)
+        L_candidates = L_valid[candidates_mask]
+        E_candidates = E_valid[candidates_mask]
+        
+        # Measure the spread of candidates (Max L - Min L)
+        spread = np.max(L_candidates) - np.min(L_candidates)
+        is_plateau = spread > (L_max - L_min) * 0.05 # If it spans more than 5% of the range, it is a plateau
+
+        # Selection of the starting point for refinement
+        if is_plateau:
+            # Plateau: choose the SMALLEST L that satisfies the tolerance (left edge of the plateau)
+            target_idx = np.argmin(L_candidates)
+            L_target = L_candidates[target_idx]
+            E_target = E_candidates[target_idx]
+            strategy = "PLATEAU (Left Edge Optimization)"
+            
+            # Bounds focused on the left edge, allowing space to check if energy can decrease further
+            search_bounds = (max(L_min, L_target * 0.5), min(L_max, L_target * 1.5))
+            
+        else:
+            # Well / V-shape: small spread, so the minimum is localized
+            # Choose the L with the LOWEST absolute energy, ignoring smaller L values
+            target_idx = np.argmin(E_candidates) 
+            L_target = L_candidates[target_idx]
+            E_target = E_candidates[target_idx]
+            strategy = "WELL (Global Min Optimization)"
+            
+            # Bounds strictly centered around the detected minimum
+            search_bounds = (max(L_min, L_target * 0.8), min(L_max, L_target * 1.2))
+
+        if verbose:
+            print(f"  > Strategy: {strategy}")
+            print(f"  > Target Start: L={L_target:.4f}")
+
+        # Final refinement (minimize_scalar): Continuous optimizer applied only within the identified region of interest
+        try:
+            res = minimize_scalar(
+                energy_wrapper, 
+                bounds=search_bounds, 
+                method='bounded', 
+                options={'xatol': 1e-5}
+            )
+            L_opt = res.x
+            E_opt = res.fun
+        except:
+            L_opt = L_target
+            E_opt = E_target
+
+       # Final validation (safety check): if refinement worsens the energy, revert to the best grid value
+        if E_opt > min_E_grid + tolerance * 10:
+             if verbose: print("  ! Refinement unstable, reverting to grid best.")
+             return L_valid[idx_sorted[0]] # Return global min
+
+        if verbose:
+            print(f"  > Final Result: L={L_opt:.6f} (E={E_opt:.14f})")
+
+        return L_opt
+    
+    def _create_smart_sampling(self, L_min, L_max, N):
+        """ Helper extracted for cleanup. """
+        # Base sampling points
+        points = np.linspace(L_min, L_max, 100)
+        
+        # If the range is large, include logarithmically spaced points to span multiple orders of magnitude
+        if L_max / L_min > 10:
+            log_points = np.logspace(np.log10(L_min), np.log10(L_max), 50)
+            points = np.concatenate([points, log_points])
+            
+        # Add higher sampling density at small L values (typically critical for RSM)
+        small_points = np.linspace(L_min, L_min + (L_max-L_min)*0.2, 30)
+        points = np.concatenate([points, small_points])
+        
+        return np.unique(np.sort(points))
+    
+    @safe_execution
+    def compute_optimal_L_curve(self, N_values: list, L_bounds: tuple = (0.1, 50.0)):
+        """
+        Computes the L_opt(N) curve as shown in Figure 2 of the paper PEDRAN RMS.
+
+        Args:
+            N_values: List of N values
+            L_bounds: Bounds for L
+
+        Returns:
+            Dictionary with {N: L_opt, ...}
+
+        """
+        results = {}
+        
+        print("Computing the L_opt(N) curve…")
+        for N in N_values:
+            L_opt = self.find_optimal_L_for_N(N, L_bounds, verbose=False)
+            results[N] = L_opt
+            print(f"  N={N:3d} -> L_opt = {L_opt:.6f}")
+        
+        return results
+    
+    @safe_execution
+    def estimate_error(self, L: float, N: int, delta_N: int = 5) -> float:
+        """
+        Estimates the error as in the paper PEDRAN RMS: δ = |E_N − E_{N+ΔN}| / |E_N|
+
+        Args:
+            L: Box length
+            N: Current number of basis functions
+            delta_N: Increment used for error estimation
+
+        Returns:
+            Estimated relative error
+        """
+        E_N = self._optimization_energy(L, N)
+        E_N_delta = self._optimization_energy(L, N + delta_N)
+        
+        return abs(E_N - E_N_delta) / abs(E_N)
+    
+    def clear_caches(self):
+        """
+        Fully and safely clears all caches.
+        """
+        # Initialize empty dictionaries for each cache
+        self._weight_cache = {}
+        self._f_integral_cache = {}
+        self._g_integral_cache = {}
+        
+        # Clear the energy cache if present
+        if hasattr(self, '_energy_cache'):
+            self._energy_cache = {}
+        
+        # Clear any additional caches that may exist
+        for attr_name in dir(self):
+            if attr_name.endswith('_cache') and isinstance(getattr(self, attr_name), dict):
+                getattr(self, attr_name).clear()
+        
+        return self
+
+# ----- Method for Unified Compute -----
+
+    @safe_execution
     def run_full_analysis(self, coeficientes, tempo: float = 100.0, pontos: int = 200):
         """
         Executes a complete analysis routine of the quantum system,
@@ -3378,166 +3973,235 @@ class SpectralMethod:
 
         Parameters
         ----------
-        coefficients : list[complex]
+        coeficientes : list[complex]
             Expansion coefficients of the wave function.
-        time : float
+        tempo : float, optional
             Maximum time for time-dependent calculations (default=100).
-        points : int
+        pontos : int, optional
             Number of sampling points for time-dependent functions (default=200).
-
         """
-        
-        print("="*80)
-        print("\n")
-        print(">>>>>>> Function Settings")
-        print(f"Time set:   {tempo}")
-        print(f"Points:     {pontos}")
-        print("\n")
-        
-        print("="*80)
-        print("\n")
-        print(">>>>>>> DESCRIBED SYSTEM")
-        print("\n")
+
+        def section(title: str):
+            print("=" * 80)
+            print(f"\n>>>>>>> {title}\n")
+
+        # Settings
+        section("Function Settings")
+        print(f"Time set: {tempo}")
+        print(f"Points:   {pontos}\n")
+
+        # System description
+        section("DESCRIBED SYSTEM")
         self.is_described()
-        print("\n")
-        
-        print("="*80)
-        print("\n")
-        print(">>>>>>> SYSTEM SOLVE...")
-        print("\n")
+
+        # Solve system
+        section("SYSTEM SOLVE...")
         self.is_solved()
-        print("\n")
         self.calculate_spectrum()
-        print("\n")
         self.calculate_eigenvectors()
-        print("\n")
         self.its_eigenpairs()
-        print("\n")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> EXPECTED POSITION")
-        print("\n")
+        # Expected position
+        section("EXPECTED POSITION")
         self.expected_position_is_calculated((0.0, tempo), coeficientes, num_points=pontos)
-        print("\n")
         self.expected_position_is_plotted()
-        print("\n")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> UNCERTAINTY AND EXPECTED POSITION")
-        print("\n")
+        # Uncertainty and expected position
+        section("UNCERTAINTY AND EXPECTED POSITION")
         self.expected_position_and_uncertainty_are_calculated((0.0, tempo), coeficientes, num_points=pontos)
-        print("\n")
         self.expected_position_and_uncertainty_are_plotted()
-        print("\n")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> UNCERTAINTY AND EXPECTED MOMENTUM")
-        print("\n")
+        # Uncertainty and expected momentum
+        section("UNCERTAINTY AND EXPECTED MOMENTUM")
         self.expected_momentum_and_uncertainty_are_calculated((0.0, tempo), coeficientes, pontos)
-        print("\n")
         self.expected_momentum_and_uncertainty_are_plotted()
-        print("\n")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> WAVEFUNCTION AND DENSITY PROBABILITY")
-        print("\n")
-        self.plot_wavefunctions(num_levels=3, save=True)
-        print("\n")
+        # Wavefunction and probability density
+        section("WAVEFUNCTION AND DENSITY PROBABILITY")
+        self.plot_eigenfunctions(num_levels=3, save=True)
         self.probability_density_is_plotted(0, coeficientes, num_frames=50, save=True)
-        print("\n")
-        self.probability_density_is_plotted((0,tempo), coeficientes, num_frames=50, save=True)
-        print("\n")
-        self.plot_wavefunction_and_density( 
-        t=0, 
-        coefficients=coeficientes, 
-        num_slices=300, 
-        color_psi='blue', 
-        linestyle_psi='-', 
-        color_rho='red', 
-        alpha_rho=0.5, 
-        title='|psi| e |psi|² em t=0', 
-        xlabel='x', 
-        )
-        print("\n")
-
-        print("="*80)
-        print("\n")
-        print(">>>>>>> UNCERTAINTY RELATIVE")
-        print("\n")
-        self.position_uncertainty_relative(coeficientes, t_max=tempo, num_points=pontos)
-        print("\n")
-        self.momentum_uncertainty_relative(coeficientes, t_max=tempo, num_points=pontos)
-        print("\n")
-
-        print("="*80)
-        print("\n")
-        print(">>>>>>> PROBABILITY DENSITY (CARTOON)")
-        print("\n")
-        self.probability_density_cartoon(
-            t=(0, tempo),
+        self.probability_density_is_plotted((0, tempo), coeficientes, num_frames=50, save=True)
+        self.plot_wavefunction_and_density(
+            t=0,
             coefficients=coeficientes,
-            num_slices=20,
-            cmap='plasma',
-            alpha=0.8,
+            num_slices=300,
+            color_psi="blue",
+            linestyle_psi="-",
+            color_rho="red",
+            alpha_rho=0.5,
+            title="|psi| e |psi|² em t=0",
+            xlabel="x",
         )
-        print("\n")
-        print("="*80)
-        print("\n")
-        print(">>>>>>> UNCERTAINTY AND EXPECTED MOMENTUM (NUMERIC)")
-        print("\n")
+        self.probability_density_3d((0, 20), coeficientes, num_frames=100, num_slices=200,
+                          cmap='plasma', title="Probability Density 3d", xlabel="x", ylabel="time", zlabel="|ψ(x,t)|²")
+        
+        # Relative uncertainties
+        section("UNCERTAINTY RELATIVE")
+        self.position_uncertainty_relative(coeficientes, t_max=tempo, num_points=pontos)
+        self.momentum_uncertainty_relative(coeficientes, t_max=tempo, num_points=pontos)
+
+        # Probability density cartoon
+        section("PROBABILITY DENSITY (CARTOON)")
+        self.probability_density_cartoon(
+            t=(0, tempo), coefficients=coeficientes, num_slices=20, cmap="plasma", alpha=0.8
+        )
+
+        # Numeric momentum functions
+        section("UNCERTAINTY AND EXPECTED MOMENTUM (NUMERIC)")
         self.expected_momentum_and_uncertainty_are_calculated((0, tempo), coeficientes, pontos)
         self.expected_momentum_and_uncertainty_are_plotted()
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> NUMERIC FUNCTIONS: <p> e dp")
-        print("\n")
-        expected_momentum_func = self.expected_momentum(coeficientes)
-        print("\n")
-        momentum_uncertainty_func = self.momentum_uncertainty(coeficientes)
-        for i in range(0, int(tempo)+1, 5):
-            print(f"t={i}: <p> = {expected_momentum_func(i)} | dp = {momentum_uncertainty_func(i)}")
-        print("\n")
+        section("NUMERIC FUNCTIONS: <x> e dx")
+        expected_position_func = self.expected_position(coeficientes)
+        position_uncertainty_func = self.position_uncertainty(coeficientes)
+        for i in range(0, int(tempo) + 1, 5):
+            print(f"t={i}: <x> = {expected_position_func(i):.15} | dx = {position_uncertainty_func(i):.15}")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> NORM OF WAVE FUNCTION")
-        print("\n")
+        section("NUMERIC FUNCTIONS: <p> e dp")
+        expected_momentum_func = self.expected_momentum(coeficientes)
+        momentum_uncertainty_func = self.momentum_uncertainty(coeficientes)
+        for i in range(0, int(tempo) + 1, 5):
+            print(f"t={i}: <p> = {expected_momentum_func(i):.15} | dp = {momentum_uncertainty_func(i):.15}")
+
+        # Norm of wave function
+        section("NORM OF WAVE FUNCTION")
         n = self.norm_of_wave_function(coeficientes)
         for t in np.linspace(0, tempo, 100):
-            print(f"Norm at t={t:.1f}: {n(t):.20}")
-        print("\n")
+            print(f"Norm at t={t:.1f}: {n(t):.15}")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> HEISENBERG UNCERTAINTY")
-        print("\n")
+        # Heisenberg uncertainty
+        section("HEISENBERG UNCERTAINTY")
         heis_fn = self.heisenberg_uncertainty(coeficientes)
-        for i in range(0, int(tempo)+1, 5):
+        for i in range(0, int(tempo) + 1, 5):
             result = heis_fn(t=i)
-            print(f"t={i} | dx.dp = {result['dx.dp']} | Heisenberg satisfy? {result['valid']}")
-        print("\n")
+            print(f"t={i} | dx.dp = {result['dx.dp']:.15} | Heisenberg satisfy? {result['valid']}")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> ANALYZE EXPECTED POSITION")
-        print("\n")
+        # Analysis
+        section("ANALYZE EXPECTED POSITION")
         self.analyze_expected_position()
-        print("\n")
 
-        print("="*80)
-        print("\n")
-        print(">>>>>>> CHECK SOLUTIONS NUMERICALLY AND GRAPHICALLY")
-        print("\n")
+        # Check solutions
+        section("CHECK SOLUTIONS NUMERICALLY AND GRAPHICALLY")
         self.check_solutions_numerically()
-        print("\n")
         self.check_solutions_graphically()
-        print("\n")
 
-        print("="*80)
-        print(">>>>>>> DONE!")
-         
+        section("DONE!")
+        """
+        Executes a complete analysis routine of the quantum system,
+        calling in sequence the main methods already implemented.
+
+        Parameters
+        ----------
+        coeficientes : list[complex]
+            Expansion coefficients of the wave function.
+        tempo : float, optional
+            Maximum time for time-dependent calculations (default=100).
+        pontos : int, optional
+            Number of sampling points for time-dependent functions (default=200).
+        """
+
+        def section(title: str):
+            print("=" * 80)
+            print(f"\n>>>>>>> {title}\n")
+
+        # Settings
+        section("Function Settings")
+        print(f"Time set: {tempo}")
+        print(f"Points:   {pontos}\n")
+
+        # System description
+        section("DESCRIBED SYSTEM")
+        self.is_described()
+
+        # Solve system
+        section("SYSTEM SOLVE...")
+        self.is_solved()
+        self.calculate_spectrum()
+        self.calculate_eigenvectors()
+        self.its_eigenpairs()
+
+        # Expected position
+        section("EXPECTED POSITION")
+        self.expected_position_is_calculated((0.0, tempo), coeficientes, num_points=pontos)
+        self.expected_position_is_plotted()
+
+        # Uncertainty and expected position
+        section("UNCERTAINTY AND EXPECTED POSITION")
+        self.expected_position_and_uncertainty_are_calculated((0.0, tempo), coeficientes, num_points=pontos)
+        self.expected_position_and_uncertainty_are_plotted()
+
+        # Uncertainty and expected momentum
+        section("UNCERTAINTY AND EXPECTED MOMENTUM")
+        self.expected_momentum_and_uncertainty_are_calculated((0.0, tempo), coeficientes, pontos)
+        self.expected_momentum_and_uncertainty_are_plotted()
+
+        # Wavefunction and probability density
+        section("WAVEFUNCTION AND DENSITY PROBABILITY")
+        self.plot_eigenfunctions(num_levels=3, save=True)
+        self.probability_density_is_plotted(0, coeficientes, num_frames=50, save=True)
+        self.probability_density_is_plotted((0, tempo), coeficientes, num_frames=50, save=True)
+        self.plot_wavefunction_and_density(
+            t=0,
+            coefficients=coeficientes,
+            num_slices=300,
+            color_psi="blue",
+            linestyle_psi="-",
+            color_rho="red",
+            alpha_rho=0.5,
+            title="|psi| e |psi|² em t=0",
+            xlabel="x",
+        )
+        self.probability_density_3d((0, 20), coeficientes, num_frames=100, num_slices=200,
+                          cmap='plasma', title="Probability Density 3d", xlabel="x", ylabel="time", zlabel="|ψ(x,t)|²")
+        
+        # Relative uncertainties
+        section("UNCERTAINTY RELATIVE")
+        self.position_uncertainty_relative(coeficientes, t_max=tempo, num_points=pontos)
+        self.momentum_uncertainty_relative(coeficientes, t_max=tempo, num_points=pontos)
+
+        # Probability density cartoon
+        section("PROBABILITY DENSITY (CARTOON)")
+        self.probability_density_cartoon(
+            t=(0, tempo), coefficients=coeficientes, num_slices=20, cmap="plasma", alpha=0.8
+        )
+
+        # Numeric momentum functions
+        section("UNCERTAINTY AND EXPECTED MOMENTUM (NUMERIC)")
+        self.expected_momentum_and_uncertainty_are_calculated((0, tempo), coeficientes, pontos)
+        self.expected_momentum_and_uncertainty_are_plotted()
+
+        section("NUMERIC FUNCTIONS: <x> e dx")
+        expected_position_func = self.expected_position(coeficientes)
+        position_uncertainty_func = self.position_uncertainty(coeficientes)
+        for i in range(0, int(tempo) + 1, 5):
+            print(f"t={i}: <x> = {expected_position_func(i):.15} | dx = {position_uncertainty_func(i):.15}")
+
+        section("NUMERIC FUNCTIONS: <p> e dp")
+        expected_momentum_func = self.expected_momentum(coeficientes)
+        momentum_uncertainty_func = self.momentum_uncertainty(coeficientes)
+        for i in range(0, int(tempo) + 1, 5):
+            print(f"t={i}: <p> = {expected_momentum_func(i):.15} | dp = {momentum_uncertainty_func(i):.15}")
+
+        # Norm of wave function
+        section("NORM OF WAVE FUNCTION")
+        n = self.norm_of_wave_function(coeficientes)
+        for t in np.linspace(0, tempo, 100):
+            print(f"Norm at t={t:.1f}: {n(t):.15}")
+
+        # Heisenberg uncertainty
+        section("HEISENBERG UNCERTAINTY")
+        heis_fn = self.heisenberg_uncertainty(coeficientes)
+        for i in range(0, int(tempo) + 1, 5):
+            result = heis_fn(t=i)
+            print(f"t={i} | dx.dp = {result['dx.dp']:.15} | Heisenberg satisfy? {result['valid']}")
+
+        # Analysis
+        section("ANALYZE EXPECTED POSITION")
+        self.analyze_expected_position()
+
+        # Check solutions
+        section("CHECK SOLUTIONS NUMERICALLY AND GRAPHICALLY")
+        self.check_solutions_numerically()
+        self.check_solutions_graphically()
+
+        section("DONE!")

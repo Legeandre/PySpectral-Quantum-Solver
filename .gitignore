@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Ambientes virtuais
+venv/
+.venv/
+
+# Pastas de saída da biblioteca (resultados da execução)
+Data/
+Figures/
+Evolution/
+Frames/
+
+# Arquivos de sistema e IDE
+.DS_Store
+.vscode/
+.idea/
